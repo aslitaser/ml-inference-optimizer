@@ -1,0 +1,69 @@
+# ML Inference Optimizer Default Configuration
+
+# Hardware configuration
+hardware:
+  gpu_count: 1                  # Number of GPUs to use
+  gpu_type: ""                  # Type of GPU (e.g., 'A100', 'V100')
+  gpu_memory_gb: 24.0           # GPU memory in GB
+  cpu_count: 8                  # Number of CPU cores to use
+
+# Model configuration
+model:
+  model_name_or_path: ""        # Model name or path (must be set by user)
+  model_type: "transformer"     # Model type (e.g., 'transformer', 'diffusion')
+  precision: "fp32"             # Model precision (fp32, fp16, bf16)
+  trust_remote_code: false      # Trust remote code when loading model
+  max_batch_size: 16            # Maximum batch size for inference
+  max_sequence_length: 1024     # Maximum sequence length
+  use_cache: true               # Use KV cache for transformer models
+  cpu_offload: false            # Offload model parts to CPU
+
+# Kernel optimizations
+kernels:
+  use_flash_attention: false    # Use Flash Attention
+  use_ring_attention: false     # Use Ring Attention
+  use_fused_mlp: false          # Use fused MLP operations
+  use_custom_layernorm: false   # Use custom LayerNorm kernel
+  use_triton_kernels: false     # Use Triton-based GPU kernels
+
+# Parallelism strategies
+parallelism:
+  tensor_parallel_size: 1       # Tensor parallelism degree
+  sequence_parallel: false      # Enable sequence parallelism
+  pipeline_parallel_size: 1     # Pipeline parallelism degree
+  data_parallel_size: 1         # Data parallelism degree
+  communication_dtype: "fp32"   # Data type for communication
+  optimization_level: 0         # Auto-parallelism optimization level (0-3)
+
+# Benchmark settings
+benchmark:
+  batch_sizes: [1, 2, 4, 8, 16] # Batch sizes to benchmark
+  sequence_lengths: [128, 512, 1024, 2048]  # Sequence lengths to benchmark
+  num_iterations: 100           # Number of iterations for benchmarking
+  warmup_iterations: 10         # Number of warmup iterations
+  report_path: "benchmark_results"  # Path to save benchmark reports
+  metrics:                      # Metrics to collect
+    - latency
+    - throughput
+    - memory
+  compare_with_baseline: true   # Compare with baseline performance
+
+# Profiling settings
+profiling:
+  enable_profiling: false       # Enable detailed profiling
+  profile_iterations: 10        # Number of iterations to profile
+  save_timeline: false          # Save profiler timeline
+  memory_profiling: false       # Track memory usage
+  bottleneck_analysis: false    # Run bottleneck analysis
+  profiler_output_dir: "profiling_results"  # Directory to save profiling results
+
+# Dashboard settings
+dashboard:
+  enable_dashboard: false       # Enable web dashboard
+  port: 8050                    # Dashboard port
+  host: "127.0.0.1"             # Dashboard host
+  update_interval_seconds: 5    # Dashboard update interval
+
+# Global settings
+output_dir: "output"            # Main output directory
+log_level: "INFO"               # Logging level (DEBUG, INFO, WARNING, ERROR)
