@@ -70,7 +70,37 @@ class ParallelConfig:
         Returns:
             Tuple[bool, str]: (is_valid, error_message)
         """
+        # Check basic validity
         is_valid, error_message = validate_parallel_config(self, self.world_size)
+        
+        # Check for advanced configuration issues
+        if is_valid:
+            # Validate that tensor and sequence parallelism aren't both active at high sizes
+            # as this can cause excessive communication overhead
+            if (self.tensor_parallel_size > 2 and self.sequence_parallel_size > 2):
+                is_valid = False
+                error_message = (
+                    f"Using high tensor parallel size ({self.tensor_parallel_size}) with "
+                    f"high sequence parallel size ({self.sequence_parallel_size}) may cause "
+                    f"excessive communication overhead. Consider reducing one dimension."
+                )
+                
+            # Validate pipeline parallelism with small models
+            expected_layers = 12  # Assuming a medium-sized model by default
+            if (self.pipeline_parallel_size > expected_layers / 3):
+                # Pipeline parallelism works best when each stage has multiple layers
+                logging.warning(
+                    f"Pipeline parallel size ({self.pipeline_parallel_size}) may be too large "
+                    f"relative to the model size. This could result in pipeline bubbles and "
+                    f"poor performance. Consider reducing pipeline_parallel_size."
+                )
+                
+            # Check compatibility of tensor parallelism with available hardware
+            if self.tensor_parallel_size > 1:
+                # In a real implementation, we would check for NVLink or similar
+                # high-bandwidth interconnect here
+                pass
+                
         return is_valid, error_message
 
     def __str__(self) -> str:
@@ -818,26 +848,319 @@ class ParallelOrchestrator:
         """
         Estimates memory usage with the current configuration.
         
+        This function estimates the memory usage of the model in different
+        parallelism configurations, including model parameters, activations,
+        optimizer states, and communication buffers.
+        
         Returns:
-            Dict[str, int]: Estimated memory usage by category
+            Dict[str, int]: Estimated memory usage in bytes by category
         """
-        # This is a placeholder implementation.
-        # In practice, would need model information for accurate estimates.
+        # Import utilities for memory estimation
+        from parallelism.parallel_utils import estimate_memory_requirements
+        
+        # Get model information if we have a model
+        model_info = {}
+        if hasattr(self, 'model') and self.model is not None:
+            # Extract parameter count
+            total_params = sum(p.numel() for p in self.model.parameters())
+            
+            # Get parameter size based on precision
+            param_dtype = next(self.model.parameters()).dtype
+            bytes_per_param = {
+                torch.float32: 4,
+                torch.float16: 2,
+                torch.bfloat16: 2,
+                torch.int8: 1
+            }.get(param_dtype, 4)
+            
+            # Calculate model size
+            model_size = total_params * bytes_per_param
+            
+            # Extract model architecture information
+            if hasattr(self.model, 'config'):
+                config = self.model.config
+                hidden_size = getattr(config, 'hidden_size', 
+                                     getattr(config, 'd_model', 1024))
+                num_layers = getattr(config, 'num_hidden_layers',
+                                   getattr(config, 'num_layers', 
+                                         getattr(config, 'n_layer', 12)))
+                num_heads = getattr(config, 'num_attention_heads',
+                                  getattr(config, 'nhead',
+                                        getattr(config, 'num_heads', 16)))
+            else:
+                # Try to deduce from the model structure
+                hidden_size = 1024  # Default
+                num_layers = 12     # Default
+                num_heads = 16      # Default
+                
+                # Try to find these values by examining the model
+                for module in self.model.modules():
+                    # Check for common transformer layer patterns
+                    if hasattr(module, 'attention') and hasattr(module, 'mlp'):
+                        # Look for hidden dimension
+                        if hasattr(module.mlp, 'fc1'):
+                            if hasattr(module.mlp.fc1, 'out_features'):
+                                hidden_size = module.mlp.fc1.in_features
+                        # Look for number of heads        
+                        if hasattr(module.attention, 'num_heads'):
+                            num_heads = module.attention.num_heads
+                            
+            model_info = {
+                'num_parameters': total_params,
+                'model_size': model_size,
+                'hidden_size': hidden_size,
+                'num_layers': num_layers,
+                'num_heads': num_heads,
+                'dtype': param_dtype
+            }
+        else:
+            # Default model information for estimation when no model is available
+            hidden_size = 1024
+            num_layers = 12
+            num_heads = 16
+            bytes_per_param = 2  # Assume fp16/bf16
+            
+            # Estimate parameter count for large language model
+            # Parameters ≈ 12 * layers * hidden_size^2
+            total_params = 12 * num_layers * hidden_size * hidden_size
+            model_size = total_params * bytes_per_param
+            
+            model_info = {
+                'num_parameters': total_params,
+                'model_size': model_size,
+                'hidden_size': hidden_size,
+                'num_layers': num_layers,
+                'num_heads': num_heads,
+                'dtype': torch.float16  # Assume fp16 by default
+            }
+            
+        # Get batch size and sequence length
+        batch_size = getattr(self, 'batch_size', 1)
+        seq_len = getattr(self, 'sequence_length', 512)
+        
+        # Calculate memory requirements for different components
+        
+        # 1. Model parameters
+        # Adjust for tensor parallelism (parameters are shared)
+        tp_size = self.config.tensor_parallel_size
+        param_memory = model_info['model_size'] // tp_size
+        
+        # 2. Activations
+        # Estimate based on standard transformer architecture
+        # Each token needs approximately 6*hidden_size bytes of activation memory per layer
+        token_activation_size = 6 * hidden_size * bytes_per_param
+        
+        # Adjust for sequence parallelism
+        sp_size = self.config.sequence_parallel_size
+        seq_per_gpu = seq_len // sp_size
+        tokens_per_gpu = batch_size * seq_per_gpu
+        
+        # Activation memory per GPU
+        activation_memory = tokens_per_gpu * token_activation_size * num_layers
+        
+        # 3. Optimizer states (not used in inference)
+        optimizer_memory = 0
+        
+        # 4. KV cache for autoregressive generation
+        kv_cache_memory = 0
+        if getattr(self, 'use_kv_cache', False):
+            # Calculate size of KV cache
+            # Each layer stores K and V tensors
+            # Each tensor is [batch_size, seq_len, num_heads, head_size]
+            head_size = hidden_size // num_heads
+            kv_cache_per_token = 2 * num_heads * head_size * bytes_per_param
+            
+            # Adjust for tensor parallelism (heads are divided)
+            kv_cache_per_token_per_gpu = kv_cache_per_token // tp_size
+            kv_cache_memory = batch_size * seq_len * kv_cache_per_token_per_gpu * num_layers
+        
+        # 5. Communication buffers
+        communication_memory = 0
+        if tp_size > 1 or sp_size > 1:
+            # For each parallel strategy, need buffers for communication
+            if tp_size > 1:
+                # For tensor parallelism, need largest activation tensor per layer
+                tp_buffer_size = batch_size * seq_per_gpu * hidden_size * bytes_per_param
+                communication_memory += 2 * tp_buffer_size  # Send and receive buffers
+            
+            if sp_size > 1:
+                # For sequence parallelism, need exchange buffers for attention
+                sp_buffer_size = batch_size * seq_per_gpu * num_heads * head_size * bytes_per_param
+                communication_memory += 2 * sp_buffer_size * num_layers
+                
+        # 6. Pipeline buffers
+        pipeline_memory = 0
+        if self.config.pipeline_parallel_size > 1:
+            # Need buffers to store micro-batch activations
+            pp_size = self.config.pipeline_parallel_size
+            micro_batch_size = max(1, batch_size // pp_size)
+            
+            # Activations at pipeline boundaries
+            pipeline_memory = micro_batch_size * seq_per_gpu * hidden_size * bytes_per_param * 2
+        
+        # 7. CUDA workspace memory (for kernels)
+        # This is highly implementation-specific, but we can estimate
+        cuda_workspace = int(0.05 * (param_memory + activation_memory))  # ~5% for workspace
+        
+        # Total memory usage
+        total_memory = (
+            param_memory + 
+            activation_memory + 
+            optimizer_memory +
+            kv_cache_memory +
+            communication_memory +
+            pipeline_memory +
+            cuda_workspace
+        )
+        
         return {
-            "model_params": 0,
-            "activations": 0,
-            "optimizer_states": 0,
-            "gradients": 0,
-            "total": 0
+            "model_params": param_memory,
+            "activations": activation_memory,
+            "optimizer_states": optimizer_memory,
+            "kv_cache": kv_cache_memory,
+            "communication_buffers": communication_memory,
+            "pipeline_buffers": pipeline_memory,
+            "cuda_workspace": cuda_workspace,
+            "total": total_memory
         }
         
     def throughput_estimate(self) -> float:
         """
         Estimates throughput with the current configuration.
         
+        This function builds a performance model to estimate throughput
+        based on parallelism configuration, model architecture, and hardware characteristics.
+        
         Returns:
-            float: Estimated throughput in samples/second
+            float: Estimated throughput in tokens/second
         """
-        # This is a placeholder implementation.
-        # In practice, would use a performance model based on model and hardware.
-        return 0.0
+        import math
+        
+        # Get model information from memory estimation
+        mem_info = self.memory_usage_estimate()
+        
+        # Extract or estimate model architecture information
+        if hasattr(self, 'model') and self.model is not None:
+            if hasattr(self.model, 'config'):
+                config = self.model.config
+                hidden_size = getattr(config, 'hidden_size', 
+                                    getattr(config, 'd_model', 1024))
+                num_layers = getattr(config, 'num_hidden_layers',
+                                   getattr(config, 'num_layers', 
+                                         getattr(config, 'n_layer', 12)))
+                num_heads = getattr(config, 'num_attention_heads',
+                                  getattr(config, 'nhead',
+                                        getattr(config, 'num_heads', 16)))
+            else:
+                # Try to deduce from the model structure
+                hidden_size = 1024  # Default
+                num_layers = 12     # Default
+                num_heads = 16      # Default
+        else:
+            # Use defaults
+            hidden_size = 1024
+            num_layers = 12
+            num_heads = 16
+            
+        # Get batch size and sequence length
+        batch_size = getattr(self, 'batch_size', 1)
+        seq_len = getattr(self, 'sequence_length', 512)
+        
+        # Estimate FLOPs per token for transformer
+        # Each token requires approximately 6*N*d^2 FLOPs 
+        # where N is num_layers and d is hidden_size
+        flops_per_token = 6 * num_layers * hidden_size * hidden_size
+        
+        # Adjust for parallelism
+        tp_size = self.config.tensor_parallel_size
+        sp_size = self.config.sequence_parallel_size
+        pp_size = self.config.pipeline_parallel_size
+        
+        # Tensor parallelism reduces compute per GPU by dividing parameter matrices
+        compute_scaling = tp_size
+        
+        # Estimate GPU compute capability (TFLOPS)
+        if torch.cuda.is_available():
+            # Crude GPU classification based on compute capability
+            cc_major = torch.cuda.get_device_capability(0)[0]
+            if cc_major >= 8:  # Ampere or newer
+                tflops_estimate = 312.0  # H100 PCIe
+            elif cc_major == 7:  # Volta/Turing
+                tflops_estimate = 125.0  # A100 PCIe
+            else:  # Older architectures
+                tflops_estimate = 30.0   # V100 PCIe
+        else:
+            # Default estimate
+            tflops_estimate = 30.0  # V100-like
+            
+        # Calculate base throughput in tokens/second (perfect scaling case)
+        raw_tokens_per_second = tflops_estimate * 1e12 / flops_per_token
+        
+        # Account for efficiency factors:
+        
+        # 1. Parallel scaling efficiency
+        # Efficiency tends to drop with increased parallelism due to communication
+        parallel_size = tp_size * sp_size * pp_size
+        if parallel_size > 1:
+            # Communication overhead increases with parallelism
+            parallel_efficiency = 1.0 - 0.1 * math.log2(parallel_size)
+            parallel_efficiency = max(0.5, parallel_efficiency)
+        else:
+            parallel_efficiency = 1.0
+            
+        # 2. Pipeline bubbles
+        if pp_size > 1:
+            # Efficiency loss due to pipeline bubbles
+            # For micro-batch size of 1, efficiency is (pp_size - 1) / pp_size
+            pipeline_efficiency = (pp_size - 1) / pp_size
+            
+            # Increase efficiency with more micro-batches
+            micro_batches = max(1, batch_size // pp_size)
+            pipeline_efficiency = (micro_batches + pp_size - 1) / (micro_batches + pp_size)
+        else:
+            pipeline_efficiency = 1.0
+            
+        # 3. Sequence efficiency
+        # Very short sequences are less efficient due to kernel overhead
+        sequence_efficiency = min(1.0, 0.5 + 0.5 * min(seq_len, 1024) / 512)
+        
+        # 4. Batch efficiency
+        # Larger batches are more efficient up to a point
+        batch_efficiency = min(1.0, 0.5 + 0.25 * math.log2(max(1, batch_size)))
+        
+        # 5. Memory efficiency
+        # If memory usage is too high, throughput suffers due to swapping/fragmentation
+        total_memory = mem_info["total"]
+        
+        # Determine available GPU memory
+        if torch.cuda.is_available():
+            available_memory = torch.cuda.get_device_properties(0).total_memory
+        else:
+            # Default estimate for high-end GPU
+            available_memory = 32 * 1024 * 1024 * 1024  # 32 GB
+            
+        memory_ratio = total_memory / available_memory
+        memory_efficiency = 1.0
+        if memory_ratio > 0.8:
+            # Sharp dropoff in performance if memory usage is too high
+            memory_efficiency = 0.5 * (1.0 - (memory_ratio - 0.8) / 0.2)
+            memory_efficiency = max(0.1, memory_efficiency)
+            
+        # Combine all efficiency factors
+        total_efficiency = (
+            parallel_efficiency * 
+            pipeline_efficiency * 
+            sequence_efficiency * 
+            batch_efficiency *
+            memory_efficiency
+        )
+        
+        # Calculate final throughput estimate
+        tokens_per_second = raw_tokens_per_second * compute_scaling * total_efficiency
+        
+        # For batch inference, multiply by effective batch size
+        effective_batch_size = batch_size
+        if batch_size > 1 and not getattr(self, 'autoregressive', True):
+            tokens_per_second *= effective_batch_size
+            
+        return tokens_per_second
