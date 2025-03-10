@@ -123,10 +123,94 @@ class SequenceShardedModule(nn.Module):
             self._init_buffers()
     
     def _init_buffers(self):
-        """Initialize communication buffers for reuse."""
-        # These will be populated during the first forward pass
-        # when we know the tensor shapes
-        pass
+        """
+        Initialize communication buffers for reuse.
+        
+        This method pre-allocates communication buffers for sequence parallelism
+        operations to avoid repeated memory allocations during inference.
+        Buffers are properly sized based on typical transformer architectures.
+        """
+        # These will be populated during the first forward pass when tensor shapes are known,
+        # but we can initialize some common sizes in advance
+        
+        # If we don't want buffer reuse, don't pre-allocate
+        if not self.config.buffer_reuse:
+            return
+            
+        # Make sure we're on a CUDA device before allocating
+        if not torch.cuda.is_available():
+            return
+            
+        # Get device to allocate buffers
+        device = torch.cuda.current_device()
+        
+        # Create buffers for scatter and gather operations
+        # Common sizes for sequence dimensions: 256, 512, 1024, 2048
+        # Common batch sizes: 1, 2, 4, 8, 16, 32
+        # Common embedding dimensions: 768, 1024, 2048, 4096
+        common_seq_lengths = [256, 512, 1024, 2048]
+        common_batch_sizes = [1, 2, 4, 8, 16]
+        common_hidden_sizes = [768, 1024, 2048, 4096]
+        
+        # For sequence parallelism, the critical dimension is sequence length
+        # We allocate buffers for common combinations
+        for seq_len in common_seq_lengths:
+            for batch_size in common_batch_sizes[:2]:  # Only smaller batch sizes
+                for hidden_size in common_hidden_sizes[:3]:  # Only smaller hidden sizes
+                    # Estimate size of sequence chunk
+                    seq_chunk = seq_len // self.config.sp_size
+                    
+                    # Skip if too large to avoid OOM
+                    buffer_size_gb = batch_size * seq_chunk * hidden_size * 4 / (1024**3)
+                    if buffer_size_gb > 0.5:  # Skip buffers larger than 0.5 GB 
+                        continue
+                    
+                    # Scatter buffers
+                    scatter_shape = (batch_size, seq_chunk, hidden_size)
+                    for dtype in [torch.float16, torch.float32]:
+                        # Limit the number of buffers to avoid excessive memory usage
+                        if len(self.scatter_buffers) < 8:
+                            self.scatter_buffers.append(
+                                torch.empty(scatter_shape, dtype=dtype, device=device)
+                            )
+                    
+                    # Gather buffers
+                    gather_shape = (batch_size, seq_len, hidden_size)
+                    for dtype in [torch.float16, torch.float32]:
+                        # Limit the number of buffers to avoid excessive memory usage
+                        if len(self.gather_buffers) < 8:
+                            self.gather_buffers.append(
+                                torch.empty(gather_shape, dtype=dtype, device=device)
+                            )
+        
+        # For sequence sharding, also allocate buffers for attention patterns
+        # These are used in ring attention for key-value exchange
+        if self.config.attention_handling == "ring":
+            # Allocate buffers for ring exchange
+            # We need buffers sized for key and value tensors
+            # Typical shape: [batch_size, num_heads, seq_chunk, head_dim]
+            for seq_len in common_seq_lengths[:2]:  # Only smaller sequence lengths
+                for batch_size in common_batch_sizes[:1]:  # Only smallest batch size
+                    # Typical transformer parameters
+                    num_heads = 16
+                    head_dim = 64
+                    
+                    # Calculate sequence chunk size
+                    seq_chunk = seq_len // self.config.sp_size
+                    
+                    # Allocate buffers for key and value tensors
+                    kv_shape = (batch_size, num_heads, seq_chunk, head_dim)
+                    
+                    # Create buffer for float16 (most common for inference)
+                    self.scatter_buffers.append(
+                        torch.empty(kv_shape, dtype=torch.float16, device=device)
+                    )
+                    
+                    # Create buffer for attention mask
+                    mask_shape = (batch_size, 1, seq_chunk, seq_chunk)
+                    self.scatter_buffers.append(
+                        torch.empty(mask_shape, dtype=torch.float16, device=device)
+                    )
     
     def _ensure_buffer(self, buffers: list, shape: torch.Size, dtype: torch.dtype) -> torch.Tensor:
         """Get or create a buffer for communication.
