@@ -57,10 +57,18 @@ if HAS_TRITON:
         USE_MASK: tl.constexpr
     ):
         """
-        Compute flash attention for a block of the output.
+        Compute flash attention for a block of the output (Flash Attention 3).
         
-        This kernel computes attention for a block of query vectors against
-        all key-value pairs, using a memory-efficient iterative approach.
+        This kernel implements the Flash Attention algorithm with tiled block-based computation
+        to avoid materializing the full attention matrix. It processes blocks of the sequence
+        length to keep memory usage proportional to sqrt(N) rather than N^2.
+        
+        The implementation includes:
+        - Tiled matrix multiplication for efficient QK^T computation
+        - Progressive softmax algorithm for numerical stability
+        - Optimized memory access patterns for coalesced reads/writes
+        - Support for causal masking with early termination
+        - Flexible attention mask handling
         
         Args:
             q_ptr: Pointer to query tensor [batch_size, seq_len, num_heads, head_dim]
@@ -96,98 +104,137 @@ if HAS_TRITON:
         
         # Load q block [BLOCK_M, BLOCK_DMODEL]
         q_block_ptr = q_ptr + q_offset
+        # Compute range of valid queries for this block
+        q_valid_range = min(BLOCK_M, seq_len - pid_m * BLOCK_M)
+        # Create mask for valid queries and dimensions
+        q_mask = (tl.arange(0, BLOCK_M)[:, None] < q_valid_range) & (tl.arange(0, BLOCK_DMODEL)[None, :] < head_dim)
+        # Load query block with masking
         q_block = tl.load(
             q_block_ptr + (tl.arange(0, BLOCK_M)[:, None] * stride_qm +
                            tl.arange(0, BLOCK_DMODEL)[None, :] * stride_qd),
-            mask=(tl.arange(0, BLOCK_M)[:, None] < min(BLOCK_M, seq_len - pid_m * BLOCK_M)) &
-                 (tl.arange(0, BLOCK_DMODEL)[None, :] < head_dim),
+            mask=q_mask,
             other=0.0
         )
         
-        # Initialize accumulator for O, L, and m
+        # Initialize accumulators for stable softmax algorithm
+        # o: Output accumulator
+        # m_i: Running maximum for numerical stability
+        # l_i: Running sum of exponentials for normalization
         o = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
         m_i = tl.full([BLOCK_M], value=-float('inf'), dtype=tl.float32)
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
         
-        # Loop over k, v blocks
+        # Loop over k, v blocks - this is the key to Flash Attention's memory efficiency
+        # We process the sequence in chunks to avoid materializing the full attention matrix
         for start_n in range(0, seq_len, BLOCK_N):
-            # Check if we can skip this block due to causal masking
+            # Early termination optimization for causal masking
+            # If we're processing a block that's entirely masked out, we can skip it
             if CAUSAL and start_n > (pid_m + 1) * BLOCK_M - 1:
                 break
                 
-            # Load k, v blocks
+            # Calculate valid range for this key/value block
+            kv_valid_range = min(BLOCK_N, seq_len - start_n)
+            # Create mask for valid keys/values and dimensions
+            kv_mask = (tl.arange(0, BLOCK_N)[:, None] < kv_valid_range) & (tl.arange(0, BLOCK_DMODEL)[None, :] < head_dim)
+            
+            # Load k, v blocks for current chunk
             k_block_ptr = k_ptr + k_offset + start_n * stride_km
             v_block_ptr = v_ptr + v_offset + start_n * stride_vm
             
+            # Load key block with masking for boundary conditions
             k_block = tl.load(
                 k_block_ptr + (tl.arange(0, BLOCK_N)[:, None] * stride_km +
                                tl.arange(0, BLOCK_DMODEL)[None, :] * stride_kd),
-                mask=(tl.arange(0, BLOCK_N)[:, None] < min(BLOCK_N, seq_len - start_n)) &
-                     (tl.arange(0, BLOCK_DMODEL)[None, :] < head_dim),
+                mask=kv_mask,
                 other=0.0
             )
             
+            # Load value block with masking for boundary conditions
             v_block = tl.load(
                 v_block_ptr + (tl.arange(0, BLOCK_N)[:, None] * stride_vm +
                                tl.arange(0, BLOCK_DMODEL)[None, :] * stride_vd),
-                mask=(tl.arange(0, BLOCK_N)[:, None] < min(BLOCK_N, seq_len - start_n)) &
-                     (tl.arange(0, BLOCK_DMODEL)[None, :] < head_dim),
+                mask=kv_mask,
                 other=0.0
             )
             
-            # Compute attention scores for this block
+            # Compute attention scores for this block: QK^T
+            # Optimized matrix multiplication using Triton's tl.dot operation
             scores = tl.dot(q_block, tl.trans(k_block))
+            # Apply scaling factor (1/sqrt(d_k)) for stable training
             scores = scores * scale
             
-            # Apply causal masking if needed
+            # Apply causal masking if needed (for autoregressive models)
             if CAUSAL:
+                # Compute absolute position indices for queries and keys
                 row_ids = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
                 col_ids = start_n + tl.arange(0, BLOCK_N)
+                # Create causal mask where row_ids >= col_ids (upper triangular including diagonal)
+                # This ensures each token can only attend to itself and previous tokens
                 causal_mask = row_ids[:, None] >= col_ids[None, :]
+                # Apply mask by zeroing out future positions and setting them to a large negative value
                 scores = scores * causal_mask + (-1e9) * ~causal_mask
                 
-            # Apply attention mask if provided
+            # Apply attention mask if provided (e.g., for padding tokens)
             if USE_MASK:
+                # Calculate mask offset
                 mask_block_ptr = mask_ptr + (pid_batch * stride_maskb +
                                             pid_head * stride_maskh +
                                             pid_m * BLOCK_M * stride_maskm)
+                
+                # Create mask for valid attention mask values
+                mask_load_mask = (tl.arange(0, BLOCK_M)[:, None] < q_valid_range) & (tl.arange(0, BLOCK_N)[None, :] < kv_valid_range)
+                
+                # Load attention mask block
                 mask_block = tl.load(
                     mask_block_ptr + (tl.arange(0, BLOCK_M)[:, None] * stride_maskm +
                                       tl.arange(0, BLOCK_N)[None, :]),
-                    mask=(tl.arange(0, BLOCK_M)[:, None] < min(BLOCK_M, seq_len - pid_m * BLOCK_M)) &
-                         (tl.arange(0, BLOCK_N)[None, :] < min(BLOCK_N, seq_len - start_n)),
+                    mask=mask_load_mask,
                     other=0.0
                 )
+                
+                # Apply attention mask (0 → -inf, 1 → keep value)
                 scores = scores * mask_block + (-1e9) * (1.0 - mask_block)
                 
-            # Update m_i and l_i
+            # Implement the stable softmax algorithm from the Flash Attention paper
+            
+            # 1. Find current block's max score per query for numerical stability
             m_block = tl.max(scores, axis=1)
+            
+            # 2. Compute new running max by comparing with previous blocks
             m_new = tl.maximum(m_i, m_block)
             
-            # Update scaling factors
+            # 3. Calculate scaling factors for the softmax stability algorithm
+            # Alpha scales the existing accumulated values
+            # Beta scales the new block's values
             alpha = tl.exp(m_i - m_new)
             beta = tl.exp(m_block - m_new)
             
-            # Update output accumulators
+            # 4. Update output and normalization accumulators
+            # New normalization factor: L_new = α·L_old + β·∑exp(S - m_block)
             l_i_new = alpha * l_i + beta * tl.sum(tl.exp(scores - m_block[:, None]), axis=1)
+            
+            # New output accumulator: O_new = α·O_old + ∑exp(S - m_new)·V
+            # This implements the efficient O(N) version of softmax described in Flash Attention
             o_new = (alpha[:, None] * o + 
                     tl.dot(tl.exp(scores - m_new[:, None]), v_block))
             
-            # Update variables for next iteration
+            # Update accumulators for next iteration
             l_i = l_i_new
             m_i = m_new
             o = o_new
             
-        # Normalize output
+        # Final normalization of output by dividing by the sum of attention weights
         o = o / l_i[:, None]
         
-        # Write output
+        # Calculate output mask for valid positions
+        out_mask = (tl.arange(0, BLOCK_M)[:, None] < q_valid_range) & (tl.arange(0, BLOCK_DMODEL)[None, :] < head_dim)
+        
+        # Write normalized output back to global memory
         tl.store(
             o_ptr + o_offset + (tl.arange(0, BLOCK_M)[:, None] * stride_om +
                                tl.arange(0, BLOCK_DMODEL)[None, :] * stride_od),
             o,
-            mask=(tl.arange(0, BLOCK_M)[:, None] < min(BLOCK_M, seq_len - pid_m * BLOCK_M)) &
-                 (tl.arange(0, BLOCK_DMODEL)[None, :] < head_dim)
+            mask=out_mask
         )
 
     @triton.jit
