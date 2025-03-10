@@ -1,12 +1,31 @@
+"""
+Fused MLP Triton Kernels.
+
+This module implements optimized Triton kernels for Multi-Layer Perceptron operations.
+These kernels fuse multiple operations to maximize data reuse and minimize memory accesses.
+
+Key features:
+- Fused FC1-Activation-FC2 operations
+- Support for GELU, SwiGLU, and ReLU activation functions
+- Efficient memory usage by keeping intermediates in shared memory
+- Optimized memory access patterns for better performance
+"""
+
 import torch
 import triton
 import triton.language as tl
+import math
+import time
 import numpy as np
-from typing import Optional, Dict
+from typing import Optional, Dict, Tuple
 
+
+#-----------------------------------------------------------------------------
+# Core FusedMLP Triton Kernels
+#-----------------------------------------------------------------------------
 
 @triton.jit
-def fused_dense_gelu_dense_kernel(
+def _fused_mlp_gelu_kernel(
     # Pointers to matrices
     input_ptr, fc1_weight_ptr, fc1_bias_ptr, fc2_weight_ptr, fc2_bias_ptr, output_ptr,
     # Matrix dimensions
@@ -17,215 +36,202 @@ def fused_dense_gelu_dense_kernel(
     fc2_weight_row_stride, fc2_weight_col_stride,
     output_batch_stride, output_row_stride, output_col_stride,
     # Meta-parameters
-    block_size: tl.constexpr,
-    block_k: tl.constexpr,
-    block_n: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     USE_BIAS: tl.constexpr,
 ):
     """
     Fused kernel that computes: FC2(GELU(FC1(x)))
     
     This kernel fuses the entire MLP operation with GELU activation into a single kernel
-    to maximize data reuse and minimize memory accesses.
+    to maximize data reuse and minimize memory accesses. It keeps intermediate results
+    in shared memory, reducing global memory traffic.
+    
+    Args:
+        input_ptr: Pointer to input tensor [batch_size, seq_len, hidden_size]
+        fc1_weight_ptr: Pointer to FC1 weight tensor [intermediate_size, hidden_size]
+        fc1_bias_ptr: Pointer to FC1 bias tensor [intermediate_size]
+        fc2_weight_ptr: Pointer to FC2 weight tensor [hidden_size, intermediate_size]
+        fc2_bias_ptr: Pointer to FC2 bias tensor [hidden_size]
+        output_ptr: Pointer to output tensor [batch_size, seq_len, hidden_size]
+        Various dimensions and strides for the tensors
+        BLOCK_SIZE: Block size for sequence dimension
+        BLOCK_K: Block size for hidden dimension
+        BLOCK_N: Block size for intermediate dimension
+        USE_BIAS: Whether to apply bias
     """
     # Program ID
-    pid_batch = tl.program_id(0)
-    pid_row = tl.program_id(1)
-    pid_col = tl.program_id(2)
+    pid_batch = tl.program_id(0)  # batch index
+    pid_row = tl.program_id(1)    # sequence index
     
     # Compute offset for the current block
     batch_offset = pid_batch * input_batch_stride
-    hidden_offset = pid_row * block_size
-    intermediate_offset_fc1 = pid_col * block_n
+    seq_offset = pid_row * BLOCK_SIZE
     
-    # Initialize pointers to input and fc1 weight
-    input_block_ptr = input_ptr + batch_offset + hidden_offset * input_col_stride
-    fc1_weight_block_ptr = fc1_weight_ptr + intermediate_offset_fc1 * fc1_weight_col_stride + 0 * fc1_weight_row_stride
-    
-    # Initialize accumulator for intermediate result
-    acc_fc1 = tl.zeros([block_size, block_n], dtype=tl.float32)
-    
-    # Load fc1 bias if using bias
-    if USE_BIAS:
-        fc1_bias = tl.load(fc1_bias_ptr + intermediate_offset_fc1 + tl.arange(0, block_n))
-    
-    # Compute FC1: Matmul with input and fc1_weight
-    for k in range(0, hidden_size, block_k):
-        # Load input block
-        k_remaining = min(block_k, hidden_size - k)
-        input_k = tl.load(input_block_ptr + k * input_col_stride + tl.arange(0, k_remaining)[None, :] * input_col_stride, 
-                          mask=tl.arange(0, block_size)[:, None] < seq_len, other=0.0)
-        
-        # Load fc1 weight block
-        fc1_weight_k = tl.load(fc1_weight_block_ptr + k * fc1_weight_row_stride + tl.arange(0, block_n)[:, None] * fc1_weight_col_stride, 
-                               mask=tl.arange(0, k_remaining)[None, :] < hidden_size, other=0.0)
-        
-        # Compute partial FC1
-        acc_fc1 += tl.dot(input_k, tl.trans(fc1_weight_k))
-    
-    # Add bias and apply GELU activation
-    if USE_BIAS:
-        intermediate = acc_fc1 + fc1_bias[None, :]
-    else:
-        intermediate = acc_fc1
-    
-    # Apply GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    sqrt_2_pi = 0.7978845608028654
-    one = 1.0
-    half = 0.5
-    coeff = 0.044715
-    
-    x_cube = intermediate * intermediate * intermediate
-    inner = sqrt_2_pi * (intermediate + coeff * x_cube)
-    intermediate = half * intermediate * (one + tl.tanh(inner))
-    
-    # Initialize pointers for FC2
-    fc2_weight_block_ptr = fc2_weight_ptr + 0 * fc2_weight_col_stride
-    output_block_ptr = output_ptr + batch_offset + hidden_offset * output_col_stride
-    
-    # Initialize accumulator for output
-    acc_fc2 = tl.zeros([block_size, hidden_size], dtype=tl.float32)
-    
-    # Compute FC2: Matmul with intermediate and fc2_weight
-    for k in range(0, intermediate_size, block_k):
-        # Load fc2 weight block
-        k_remaining = min(block_k, intermediate_size - k)
-        fc2_weight_k = tl.load(fc2_weight_block_ptr + k * fc2_weight_row_stride + tl.arange(0, hidden_size)[None, :] * fc2_weight_col_stride,
-                               mask=tl.arange(0, k_remaining)[:, None] < intermediate_size, other=0.0)
-        
-        # Extract corresponding part of intermediate
-        intermediate_k = intermediate[:, k:k+k_remaining]
-        
-        # Compute partial FC2
-        acc_fc2 += tl.dot(intermediate_k, fc2_weight_k)
-    
-    # Add fc2 bias if using bias
-    if USE_BIAS:
-        fc2_bias = tl.load(fc2_bias_ptr + tl.arange(0, hidden_size))
-        acc_fc2 += fc2_bias
-    
-    # Store output
-    output_mask = (tl.arange(0, block_size)[:, None] < seq_len) & (tl.arange(0, hidden_size)[None, :] < hidden_size)
-    tl.store(output_block_ptr + tl.arange(0, hidden_size)[None, :] * output_col_stride, acc_fc2, mask=output_mask)
-
-
-@triton.jit
-def fused_bias_gelu_kernel(
-    input_ptr, bias_ptr, output_ptr,
-    n_elements,
-    block_size: tl.constexpr,
-):
-    """
-    Fused kernel that computes: GELU(x + bias)
-    
-    This kernel fuses the bias addition with GELU activation for better performance.
-    """
-    # Program ID
-    pid = tl.program_id(0)
-    
-    # Block start index
-    block_start = pid * block_size
-    
-    # Compute offsets
-    offsets = block_start + tl.arange(0, block_size)
-    mask = offsets < n_elements
-    
-    # Load input and bias
-    x = tl.load(input_ptr + offsets, mask=mask, other=0.0)
-    b = tl.load(bias_ptr + offsets % (n_elements // x.shape[0]), mask=mask, other=0.0)
-    
-    # Add bias
-    x_bias = x + b
-    
-    # Apply GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    sqrt_2_pi = 0.7978845608028654
-    one = 1.0
-    half = 0.5
-    coeff = 0.044715
-    
-    x_cube = x_bias * x_bias * x_bias
-    inner = sqrt_2_pi * (x_bias + coeff * x_cube)
-    output = half * x_bias * (one + tl.tanh(inner))
-    
-    # Store output
-    tl.store(output_ptr + offsets, output, mask=mask)
-
-
-@triton.jit
-def fused_bias_swiglu_kernel(
-    input_ptr, w1_ptr, w2_ptr, b1_ptr, b2_ptr, output_ptr,
-    batch_size, seq_len, hidden_size, intermediate_size,
-    input_batch_stride, input_row_stride, input_col_stride,
-    weight_row_stride, weight_col_stride,
-    output_batch_stride, output_row_stride, output_col_stride,
-    block_size: tl.constexpr,
-    block_k: tl.constexpr,
-    USE_BIAS: tl.constexpr,
-):
-    """
-    Fused kernel that computes SwiGLU activation: SiLU(Wx1 + b1) * (Wx2 + b2)
-    
-    This kernel is specialized for the SwiGLU activation used in models like LLaMa.
-    """
-    # Program ID
-    pid_batch = tl.program_id(0)
-    pid_row = tl.program_id(1)
-    
-    # Compute offset for the current block
-    batch_offset = pid_batch * input_batch_stride
-    hidden_offset = pid_row * block_size
-    
-    # Initialize pointers to input and weights
-    input_block_ptr = input_ptr + batch_offset + hidden_offset * input_col_stride
-    
-    # Initialize accumulators for gate (x1) and value (x2)
-    acc_gate = tl.zeros([block_size, intermediate_size], dtype=tl.float32)
-    acc_value = tl.zeros([block_size, intermediate_size], dtype=tl.float32)
-    
-    # Compute gate and value projections
-    for k in range(0, hidden_size, block_k):
-        # Load input block
-        k_remaining = min(block_k, hidden_size - k)
-        input_k = tl.load(input_block_ptr + k * input_col_stride + tl.arange(0, k_remaining)[None, :] * input_col_stride, 
-                          mask=tl.arange(0, block_size)[:, None] < seq_len, other=0.0)
-        
-        # Load weight blocks for gate (w1) and value (w2)
-        w1_block_ptr = w1_ptr + k * weight_row_stride
-        w2_block_ptr = w2_ptr + k * weight_row_stride
-        
-        w1_k = tl.load(w1_block_ptr + tl.arange(0, intermediate_size)[None, :] * weight_col_stride, 
-                       mask=tl.arange(0, k_remaining)[:, None] < hidden_size, other=0.0)
-        
-        w2_k = tl.load(w2_block_ptr + tl.arange(0, intermediate_size)[None, :] * weight_col_stride, 
-                       mask=tl.arange(0, k_remaining)[:, None] < hidden_size, other=0.0)
-        
-        # Compute partial projections
-        acc_gate += tl.dot(input_k, w1_k)
-        acc_value += tl.dot(input_k, w2_k)
-    
-    # Add biases if using bias
-    if USE_BIAS:
-        b1 = tl.load(b1_ptr + tl.arange(0, intermediate_size))
-        b2 = tl.load(b2_ptr + tl.arange(0, intermediate_size))
-        
-        acc_gate += b1
-        acc_value += b2
-    
-    # Apply SwiGLU activation: SiLU(gate) * value
-    # SiLU(x) = x * sigmoid(x)
-    gate_sigmoid = 1.0 / (1.0 + tl.exp(-acc_gate))
-    swiglu_result = (acc_gate * gate_sigmoid) * acc_value
+    # Initialize pointers to input
+    input_block_ptr = input_ptr + batch_offset + seq_offset * input_row_stride
     
     # Initialize pointer for output
-    output_block_ptr = output_ptr + batch_offset + hidden_offset * output_col_stride
+    output_block_ptr = output_ptr + batch_offset + seq_offset * output_row_stride
     
-    # Store output
-    output_mask = (tl.arange(0, block_size)[:, None] < seq_len) & (tl.arange(0, intermediate_size)[None, :] < intermediate_size)
-    tl.store(output_block_ptr + tl.arange(0, intermediate_size)[None, :] * output_col_stride, swiglu_result, mask=output_mask)
+    # Compute number of valid elements in current block
+    valid_seq_len = min(BLOCK_SIZE, seq_len - seq_offset)
+    
+    # Load input block [BLOCK_SIZE, hidden_size]
+    input_mask = tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len
+    
+    # Allocate shared memory for intermediate results
+    # This is the key optimization - keeping the intermediate results in shared memory
+    # rather than writing them to global memory
+    intermediate = tl.zeros([BLOCK_SIZE, intermediate_size], dtype=tl.float32)
+    
+    # Step 1: Compute FC1(x) -> [BLOCK_SIZE, intermediate_size]
+    # We process this in tiles to handle large hidden/intermediate dimensions
+    for h_start in range(0, hidden_size, BLOCK_K):
+        # Compute number of valid hidden dimensions in current block
+        valid_hidden_k = min(BLOCK_K, hidden_size - h_start)
+        
+        # Load input tile [BLOCK_SIZE, BLOCK_K]
+        x_tile_ptr = input_block_ptr + h_start * input_col_stride
+        x_tile_mask = input_mask & (tl.arange(0, BLOCK_K)[None, :] < valid_hidden_k)
+        x_tile = tl.load(
+            x_tile_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * input_row_stride + 
+            tl.arange(0, BLOCK_K)[None, :] * input_col_stride,
+            mask=x_tile_mask,
+            other=0.0
+        )
+        
+        # Process intermediate dimension in tiles
+        for i_start in range(0, intermediate_size, BLOCK_N):
+            # Compute number of valid intermediate dimensions
+            valid_inter_n = min(BLOCK_N, intermediate_size - i_start)
+            
+            # Load weight tile for FC1 [BLOCK_K, BLOCK_N]
+            fc1_weight_tile_ptr = fc1_weight_ptr + h_start * fc1_weight_col_stride + i_start * fc1_weight_row_stride
+            fc1_weight_mask = (tl.arange(0, BLOCK_K)[:, None] < valid_hidden_k) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+            fc1_weight_tile = tl.load(
+                fc1_weight_tile_ptr + tl.arange(0, BLOCK_K)[:, None] * fc1_weight_col_stride + 
+                tl.arange(0, BLOCK_N)[None, :] * fc1_weight_row_stride,
+                mask=fc1_weight_mask,
+                other=0.0
+            )
+            
+            # Compute partial FC1: [BLOCK_SIZE, BLOCK_K] x [BLOCK_K, BLOCK_N] -> [BLOCK_SIZE, BLOCK_N]
+            partial_fc1 = tl.dot(x_tile, fc1_weight_tile)
+            
+            # Accumulate result to intermediate buffer
+            intermediate_indices = tl.arange(0, BLOCK_N) + i_start
+            intermediate_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (intermediate_indices[None, :] < intermediate_size)
+            intermediate[:, i_start:i_start+BLOCK_N] += partial_fc1
+    
+    # Apply FC1 bias if using bias
+    if USE_BIAS:
+        # Load bias for FC1
+        for i_start in range(0, intermediate_size, BLOCK_N):
+            valid_inter_n = min(BLOCK_N, intermediate_size - i_start)
+            fc1_bias_mask = tl.arange(0, BLOCK_N) < valid_inter_n
+            fc1_bias_tile = tl.load(
+                fc1_bias_ptr + i_start + tl.arange(0, BLOCK_N),
+                mask=fc1_bias_mask,
+                other=0.0
+            )
+            
+            # Add bias to intermediate
+            intermediate_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+            intermediate[:, i_start:i_start+BLOCK_N] = intermediate[:, i_start:i_start+BLOCK_N] + fc1_bias_tile[None, :]
+    
+    # Apply GELU activation: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    sqrt_2_pi = 0.7978845608028654
+    one = 1.0
+    half = 0.5
+    coeff = 0.044715
+    
+    # Process activation in tiles to manage shared memory usage
+    for i_start in range(0, intermediate_size, BLOCK_N):
+        valid_inter_n = min(BLOCK_N, intermediate_size - i_start)
+        intermediate_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+        
+        # Get intermediate tile
+        intermediate_tile = intermediate[:, i_start:i_start+BLOCK_N]
+        
+        # Apply GELU
+        x_cube = intermediate_tile * intermediate_tile * intermediate_tile
+        inner = sqrt_2_pi * (intermediate_tile + coeff * x_cube)
+        intermediate_tile = half * intermediate_tile * (one + tl.tanh(inner))
+        
+        # Update intermediate buffer with activated values
+        intermediate[:, i_start:i_start+BLOCK_N] = intermediate_tile
+    
+    # Initialize accumulator for output
+    output = tl.zeros([BLOCK_SIZE, hidden_size], dtype=tl.float32)
+    
+    # Step 2: Compute FC2(intermediate) -> [BLOCK_SIZE, hidden_size]
+    # Process in tiles
+    for i_start in range(0, intermediate_size, BLOCK_K):
+        # Compute number of valid intermediate dimensions
+        valid_inter_k = min(BLOCK_K, intermediate_size - i_start)
+        
+        # Get intermediate tile after activation
+        intermediate_tile = intermediate[:, i_start:i_start+BLOCK_K]
+        
+        # Process hidden dimension in tiles
+        for h_start in range(0, hidden_size, BLOCK_N):
+            # Compute number of valid hidden dimensions
+            valid_hidden_n = min(BLOCK_N, hidden_size - h_start)
+            
+            # Load weight tile for FC2 [BLOCK_K, BLOCK_N]
+            fc2_weight_tile_ptr = fc2_weight_ptr + i_start * fc2_weight_col_stride + h_start * fc2_weight_row_stride
+            fc2_weight_mask = (tl.arange(0, BLOCK_K)[:, None] < valid_inter_k) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+            fc2_weight_tile = tl.load(
+                fc2_weight_tile_ptr + tl.arange(0, BLOCK_K)[:, None] * fc2_weight_col_stride + 
+                tl.arange(0, BLOCK_N)[None, :] * fc2_weight_row_stride,
+                mask=fc2_weight_mask,
+                other=0.0
+            )
+            
+            # Compute partial FC2: [BLOCK_SIZE, BLOCK_K] x [BLOCK_K, BLOCK_N] -> [BLOCK_SIZE, BLOCK_N]
+            partial_fc2 = tl.dot(intermediate_tile, fc2_weight_tile)
+            
+            # Accumulate result to output buffer
+            output_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+            output[:, h_start:h_start+BLOCK_N] += partial_fc2
+    
+    # Apply FC2 bias if using bias
+    if USE_BIAS:
+        # Load bias for FC2
+        for h_start in range(0, hidden_size, BLOCK_N):
+            valid_hidden_n = min(BLOCK_N, hidden_size - h_start)
+            fc2_bias_mask = tl.arange(0, BLOCK_N) < valid_hidden_n
+            fc2_bias_tile = tl.load(
+                fc2_bias_ptr + h_start + tl.arange(0, BLOCK_N),
+                mask=fc2_bias_mask,
+                other=0.0
+            )
+            
+            # Add bias to output
+            output_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+            output[:, h_start:h_start+BLOCK_N] = output[:, h_start:h_start+BLOCK_N] + fc2_bias_tile[None, :]
+    
+    # Store final output
+    for h_start in range(0, hidden_size, BLOCK_N):
+        valid_hidden_n = min(BLOCK_N, hidden_size - h_start)
+        output_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+        
+        # Get output tile
+        output_tile = output[:, h_start:h_start+BLOCK_N]
+        
+        # Store output tile
+        tl.store(
+            output_block_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * output_row_stride + 
+            (h_start + tl.arange(0, BLOCK_N)[None, :]) * output_col_stride,
+            output_tile,
+            mask=output_mask
+        )
 
 
 @triton.jit
-def fused_dense_relu_dense_kernel(
+def _fused_mlp_relu_kernel(
     # Pointers to matrices
     input_ptr, fc1_weight_ptr, fc1_bias_ptr, fc2_weight_ptr, fc2_bias_ptr, output_ptr,
     # Matrix dimensions
@@ -236,561 +242,856 @@ def fused_dense_relu_dense_kernel(
     fc2_weight_row_stride, fc2_weight_col_stride,
     output_batch_stride, output_row_stride, output_col_stride,
     # Meta-parameters
-    block_size: tl.constexpr,
-    block_k: tl.constexpr,
-    block_n: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
     USE_BIAS: tl.constexpr,
 ):
     """
     Fused kernel that computes: FC2(ReLU(FC1(x)))
     
-    This kernel fuses the entire MLP operation with ReLU activation into a single kernel
-    to maximize data reuse and minimize memory accesses.
+    Similar to the GELU version, but uses ReLU activation function instead.
+    ReLU is simpler and often faster than GELU.
+    
+    Args:
+        Same as _fused_mlp_gelu_kernel
     """
     # Program ID
-    pid_batch = tl.program_id(0)
-    pid_row = tl.program_id(1)
-    pid_col = tl.program_id(2)
+    pid_batch = tl.program_id(0)  # batch index
+    pid_row = tl.program_id(1)    # sequence index
     
     # Compute offset for the current block
     batch_offset = pid_batch * input_batch_stride
-    hidden_offset = pid_row * block_size
-    intermediate_offset_fc1 = pid_col * block_n
+    seq_offset = pid_row * BLOCK_SIZE
     
-    # Initialize pointers to input and fc1 weight
-    input_block_ptr = input_ptr + batch_offset + hidden_offset * input_col_stride
-    fc1_weight_block_ptr = fc1_weight_ptr + intermediate_offset_fc1 * fc1_weight_col_stride + 0 * fc1_weight_row_stride
+    # Initialize pointers to input
+    input_block_ptr = input_ptr + batch_offset + seq_offset * input_row_stride
     
-    # Initialize accumulator for intermediate result
-    acc_fc1 = tl.zeros([block_size, block_n], dtype=tl.float32)
+    # Initialize pointer for output
+    output_block_ptr = output_ptr + batch_offset + seq_offset * output_row_stride
     
-    # Load fc1 bias if using bias
-    if USE_BIAS:
-        fc1_bias = tl.load(fc1_bias_ptr + intermediate_offset_fc1 + tl.arange(0, block_n))
+    # Compute number of valid elements in current block
+    valid_seq_len = min(BLOCK_SIZE, seq_len - seq_offset)
     
-    # Compute FC1: Matmul with input and fc1_weight
-    for k in range(0, hidden_size, block_k):
-        # Load input block
-        k_remaining = min(block_k, hidden_size - k)
-        input_k = tl.load(input_block_ptr + k * input_col_stride + tl.arange(0, k_remaining)[None, :] * input_col_stride, 
-                          mask=tl.arange(0, block_size)[:, None] < seq_len, other=0.0)
+    # Load input block [BLOCK_SIZE, hidden_size]
+    input_mask = tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len
+    
+    # Allocate shared memory for intermediate results
+    intermediate = tl.zeros([BLOCK_SIZE, intermediate_size], dtype=tl.float32)
+    
+    # Step 1: Compute FC1(x) -> [BLOCK_SIZE, intermediate_size]
+    for h_start in range(0, hidden_size, BLOCK_K):
+        # Compute number of valid hidden dimensions
+        valid_hidden_k = min(BLOCK_K, hidden_size - h_start)
         
-        # Load fc1 weight block
-        fc1_weight_k = tl.load(fc1_weight_block_ptr + k * fc1_weight_row_stride + tl.arange(0, block_n)[:, None] * fc1_weight_col_stride, 
-                               mask=tl.arange(0, k_remaining)[None, :] < hidden_size, other=0.0)
+        # Load input tile [BLOCK_SIZE, BLOCK_K]
+        x_tile_ptr = input_block_ptr + h_start * input_col_stride
+        x_tile_mask = input_mask & (tl.arange(0, BLOCK_K)[None, :] < valid_hidden_k)
+        x_tile = tl.load(
+            x_tile_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * input_row_stride + 
+            tl.arange(0, BLOCK_K)[None, :] * input_col_stride,
+            mask=x_tile_mask,
+            other=0.0
+        )
         
-        # Compute partial FC1
-        acc_fc1 += tl.dot(input_k, tl.trans(fc1_weight_k))
+        # Process intermediate dimension in tiles
+        for i_start in range(0, intermediate_size, BLOCK_N):
+            # Compute number of valid intermediate dimensions
+            valid_inter_n = min(BLOCK_N, intermediate_size - i_start)
+            
+            # Load weight tile for FC1 [BLOCK_K, BLOCK_N]
+            fc1_weight_tile_ptr = fc1_weight_ptr + h_start * fc1_weight_col_stride + i_start * fc1_weight_row_stride
+            fc1_weight_mask = (tl.arange(0, BLOCK_K)[:, None] < valid_hidden_k) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+            fc1_weight_tile = tl.load(
+                fc1_weight_tile_ptr + tl.arange(0, BLOCK_K)[:, None] * fc1_weight_col_stride + 
+                tl.arange(0, BLOCK_N)[None, :] * fc1_weight_row_stride,
+                mask=fc1_weight_mask,
+                other=0.0
+            )
+            
+            # Compute partial FC1: [BLOCK_SIZE, BLOCK_K] x [BLOCK_K, BLOCK_N] -> [BLOCK_SIZE, BLOCK_N]
+            partial_fc1 = tl.dot(x_tile, fc1_weight_tile)
+            
+            # Accumulate result to intermediate buffer
+            intermediate_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+            intermediate[:, i_start:i_start+BLOCK_N] += partial_fc1
     
-    # Add bias and apply ReLU activation
+    # Apply FC1 bias if using bias
     if USE_BIAS:
-        intermediate = acc_fc1 + fc1_bias[None, :]
-    else:
-        intermediate = acc_fc1
+        # Load bias for FC1
+        for i_start in range(0, intermediate_size, BLOCK_N):
+            valid_inter_n = min(BLOCK_N, intermediate_size - i_start)
+            fc1_bias_mask = tl.arange(0, BLOCK_N) < valid_inter_n
+            fc1_bias_tile = tl.load(
+                fc1_bias_ptr + i_start + tl.arange(0, BLOCK_N),
+                mask=fc1_bias_mask,
+                other=0.0
+            )
+            
+            # Add bias to intermediate
+            intermediate_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+            intermediate[:, i_start:i_start+BLOCK_N] = intermediate[:, i_start:i_start+BLOCK_N] + fc1_bias_tile[None, :]
     
     # Apply ReLU activation: max(0, x)
-    intermediate = tl.maximum(0.0, intermediate)
-    
-    # Initialize pointers for FC2
-    fc2_weight_block_ptr = fc2_weight_ptr + 0 * fc2_weight_col_stride
-    output_block_ptr = output_ptr + batch_offset + hidden_offset * output_col_stride
+    # Process activation in tiles to manage shared memory usage
+    for i_start in range(0, intermediate_size, BLOCK_N):
+        valid_inter_n = min(BLOCK_N, intermediate_size - i_start)
+        intermediate_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+        
+        # Get intermediate tile
+        intermediate_tile = intermediate[:, i_start:i_start+BLOCK_N]
+        
+        # Apply ReLU
+        intermediate_tile = tl.maximum(0.0, intermediate_tile)
+        
+        # Update intermediate buffer with activated values
+        intermediate[:, i_start:i_start+BLOCK_N] = intermediate_tile
     
     # Initialize accumulator for output
-    acc_fc2 = tl.zeros([block_size, hidden_size], dtype=tl.float32)
+    output = tl.zeros([BLOCK_SIZE, hidden_size], dtype=tl.float32)
     
-    # Compute FC2: Matmul with intermediate and fc2_weight
-    for k in range(0, intermediate_size, block_k):
-        # Load fc2 weight block
-        k_remaining = min(block_k, intermediate_size - k)
-        fc2_weight_k = tl.load(fc2_weight_block_ptr + k * fc2_weight_row_stride + tl.arange(0, hidden_size)[None, :] * fc2_weight_col_stride,
-                               mask=tl.arange(0, k_remaining)[:, None] < intermediate_size, other=0.0)
+    # Step 2: Compute FC2(intermediate) -> [BLOCK_SIZE, hidden_size]
+    # Process in tiles
+    for i_start in range(0, intermediate_size, BLOCK_K):
+        # Compute number of valid intermediate dimensions
+        valid_inter_k = min(BLOCK_K, intermediate_size - i_start)
         
-        # Extract corresponding part of intermediate
-        intermediate_k = intermediate[:, k:k+k_remaining]
+        # Get intermediate tile after activation
+        intermediate_tile = intermediate[:, i_start:i_start+BLOCK_K]
         
-        # Compute partial FC2
-        acc_fc2 += tl.dot(intermediate_k, fc2_weight_k)
+        # Process hidden dimension in tiles
+        for h_start in range(0, hidden_size, BLOCK_N):
+            # Compute number of valid hidden dimensions
+            valid_hidden_n = min(BLOCK_N, hidden_size - h_start)
+            
+            # Load weight tile for FC2 [BLOCK_K, BLOCK_N]
+            fc2_weight_tile_ptr = fc2_weight_ptr + i_start * fc2_weight_col_stride + h_start * fc2_weight_row_stride
+            fc2_weight_mask = (tl.arange(0, BLOCK_K)[:, None] < valid_inter_k) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+            fc2_weight_tile = tl.load(
+                fc2_weight_tile_ptr + tl.arange(0, BLOCK_K)[:, None] * fc2_weight_col_stride + 
+                tl.arange(0, BLOCK_N)[None, :] * fc2_weight_row_stride,
+                mask=fc2_weight_mask,
+                other=0.0
+            )
+            
+            # Compute partial FC2: [BLOCK_SIZE, BLOCK_K] x [BLOCK_K, BLOCK_N] -> [BLOCK_SIZE, BLOCK_N]
+            partial_fc2 = tl.dot(intermediate_tile, fc2_weight_tile)
+            
+            # Accumulate result to output buffer
+            output_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+            output[:, h_start:h_start+BLOCK_N] += partial_fc2
     
-    # Add fc2 bias if using bias
+    # Apply FC2 bias if using bias
     if USE_BIAS:
-        fc2_bias = tl.load(fc2_bias_ptr + tl.arange(0, hidden_size))
-        acc_fc2 += fc2_bias
+        # Load bias for FC2
+        for h_start in range(0, hidden_size, BLOCK_N):
+            valid_hidden_n = min(BLOCK_N, hidden_size - h_start)
+            fc2_bias_mask = tl.arange(0, BLOCK_N) < valid_hidden_n
+            fc2_bias_tile = tl.load(
+                fc2_bias_ptr + h_start + tl.arange(0, BLOCK_N),
+                mask=fc2_bias_mask,
+                other=0.0
+            )
+            
+            # Add bias to output
+            output_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+            output[:, h_start:h_start+BLOCK_N] = output[:, h_start:h_start+BLOCK_N] + fc2_bias_tile[None, :]
     
-    # Store output
-    output_mask = (tl.arange(0, block_size)[:, None] < seq_len) & (tl.arange(0, hidden_size)[None, :] < hidden_size)
-    tl.store(output_block_ptr + tl.arange(0, hidden_size)[None, :] * output_col_stride, acc_fc2, mask=output_mask)
+    # Store final output
+    for h_start in range(0, hidden_size, BLOCK_N):
+        valid_hidden_n = min(BLOCK_N, hidden_size - h_start)
+        output_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+        
+        # Get output tile
+        output_tile = output[:, h_start:h_start+BLOCK_N]
+        
+        # Store output tile
+        tl.store(
+            output_block_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * output_row_stride + 
+            (h_start + tl.arange(0, BLOCK_N)[None, :]) * output_col_stride,
+            output_tile,
+            mask=output_mask
+        )
 
 
-# Python wrapper functions
+@triton.jit
+def _fused_mlp_swiglu_kernel(
+    # Pointers to matrices
+    input_ptr, gate_weight_ptr, gate_bias_ptr, value_weight_ptr, value_bias_ptr, 
+    fc2_weight_ptr, fc2_bias_ptr, output_ptr,
+    # Matrix dimensions
+    batch_size, seq_len, hidden_size, intermediate_size,
+    # Strides
+    input_batch_stride, input_row_stride, input_col_stride,
+    gate_weight_row_stride, gate_weight_col_stride,
+    value_weight_row_stride, value_weight_col_stride,
+    fc2_weight_row_stride, fc2_weight_col_stride,
+    output_batch_stride, output_row_stride, output_col_stride,
+    # Meta-parameters
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_BIAS: tl.constexpr,
+):
+    """
+    Fused kernel that computes SwiGLU activation followed by linear projection:
+    FC2(SwiGLU(FC1_gate, FC1_value))
+    
+    SwiGLU is defined as: SiLU(gate_proj) * value_proj
+    SiLU(x) = x * sigmoid(x)
+    
+    Args:
+        input_ptr: Pointer to input tensor
+        gate_weight_ptr: Pointer to gate projection weights
+        gate_bias_ptr: Pointer to gate projection bias
+        value_weight_ptr: Pointer to value projection weights
+        value_bias_ptr: Pointer to value projection bias
+        fc2_weight_ptr: Pointer to output projection weights
+        fc2_bias_ptr: Pointer to output projection bias
+        output_ptr: Pointer to output tensor
+        Various dimensions and strides for the tensors
+        BLOCK_SIZE: Block size for sequence dimension
+        BLOCK_K: Block size for hidden dimension
+        BLOCK_N: Block size for intermediate dimension
+        USE_BIAS: Whether to apply bias
+    """
+    # Program ID
+    pid_batch = tl.program_id(0)  # batch index
+    pid_row = tl.program_id(1)    # sequence index
+    
+    # Compute offset for the current block
+    batch_offset = pid_batch * input_batch_stride
+    seq_offset = pid_row * BLOCK_SIZE
+    
+    # Initialize pointers to input
+    input_block_ptr = input_ptr + batch_offset + seq_offset * input_row_stride
+    
+    # Initialize pointer for output
+    output_block_ptr = output_ptr + batch_offset + seq_offset * output_row_stride
+    
+    # Compute number of valid elements in current block
+    valid_seq_len = min(BLOCK_SIZE, seq_len - seq_offset)
+    
+    # Load input block [BLOCK_SIZE, hidden_size]
+    input_mask = tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len
+    
+    # Allocate shared memory for intermediate results
+    gate_proj = tl.zeros([BLOCK_SIZE, intermediate_size], dtype=tl.float32)
+    value_proj = tl.zeros([BLOCK_SIZE, intermediate_size], dtype=tl.float32)
+    
+    # Step 1: Compute gate and value projections -> [BLOCK_SIZE, intermediate_size]
+    for h_start in range(0, hidden_size, BLOCK_K):
+        # Compute number of valid hidden dimensions
+        valid_hidden_k = min(BLOCK_K, hidden_size - h_start)
+        
+        # Load input tile [BLOCK_SIZE, BLOCK_K]
+        x_tile_ptr = input_block_ptr + h_start * input_col_stride
+        x_tile_mask = input_mask & (tl.arange(0, BLOCK_K)[None, :] < valid_hidden_k)
+        x_tile = tl.load(
+            x_tile_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * input_row_stride + 
+            tl.arange(0, BLOCK_K)[None, :] * input_col_stride,
+            mask=x_tile_mask,
+            other=0.0
+        )
+        
+        # Process intermediate dimension in tiles
+        for i_start in range(0, intermediate_size, BLOCK_N):
+            # Compute number of valid intermediate dimensions
+            valid_inter_n = min(BLOCK_N, intermediate_size - i_start)
+            
+            # Load gate weight tile [BLOCK_K, BLOCK_N]
+            gate_weight_tile_ptr = gate_weight_ptr + h_start * gate_weight_col_stride + i_start * gate_weight_row_stride
+            weight_mask = (tl.arange(0, BLOCK_K)[:, None] < valid_hidden_k) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+            gate_weight_tile = tl.load(
+                gate_weight_tile_ptr + tl.arange(0, BLOCK_K)[:, None] * gate_weight_col_stride + 
+                tl.arange(0, BLOCK_N)[None, :] * gate_weight_row_stride,
+                mask=weight_mask,
+                other=0.0
+            )
+            
+            # Load value weight tile [BLOCK_K, BLOCK_N]
+            value_weight_tile_ptr = value_weight_ptr + h_start * value_weight_col_stride + i_start * value_weight_row_stride
+            value_weight_tile = tl.load(
+                value_weight_tile_ptr + tl.arange(0, BLOCK_K)[:, None] * value_weight_col_stride + 
+                tl.arange(0, BLOCK_N)[None, :] * value_weight_row_stride,
+                mask=weight_mask,
+                other=0.0
+            )
+            
+            # Compute partial projections: [BLOCK_SIZE, BLOCK_K] x [BLOCK_K, BLOCK_N] -> [BLOCK_SIZE, BLOCK_N]
+            partial_gate = tl.dot(x_tile, gate_weight_tile)
+            partial_value = tl.dot(x_tile, value_weight_tile)
+            
+            # Accumulate results to intermediate buffers
+            intermediate_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+            gate_proj[:, i_start:i_start+BLOCK_N] += partial_gate
+            value_proj[:, i_start:i_start+BLOCK_N] += partial_value
+    
+    # Apply bias if using bias
+    if USE_BIAS:
+        # Load and apply bias for gate and value projections
+        for i_start in range(0, intermediate_size, BLOCK_N):
+            valid_inter_n = min(BLOCK_N, intermediate_size - i_start)
+            bias_mask = tl.arange(0, BLOCK_N) < valid_inter_n
+            
+            # Gate bias
+            gate_bias_tile = tl.load(
+                gate_bias_ptr + i_start + tl.arange(0, BLOCK_N),
+                mask=bias_mask,
+                other=0.0
+            )
+            
+            # Value bias
+            value_bias_tile = tl.load(
+                value_bias_ptr + i_start + tl.arange(0, BLOCK_N),
+                mask=bias_mask,
+                other=0.0
+            )
+            
+            # Add bias to projections
+            intermediate_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+            gate_proj[:, i_start:i_start+BLOCK_N] = gate_proj[:, i_start:i_start+BLOCK_N] + gate_bias_tile[None, :]
+            value_proj[:, i_start:i_start+BLOCK_N] = value_proj[:, i_start:i_start+BLOCK_N] + value_bias_tile[None, :]
+    
+    # Apply SwiGLU activation: SiLU(gate_proj) * value_proj
+    # SiLU(x) = x * sigmoid(x)
+    # Process activation in tiles to manage shared memory usage
+    for i_start in range(0, intermediate_size, BLOCK_N):
+        valid_inter_n = min(BLOCK_N, intermediate_size - i_start)
+        intermediate_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_inter_n)
+        
+        # Get intermediate tiles
+        gate_tile = gate_proj[:, i_start:i_start+BLOCK_N]
+        value_tile = value_proj[:, i_start:i_start+BLOCK_N]
+        
+        # Apply SiLU to gate
+        gate_sigmoid = 1.0 / (1.0 + tl.exp(-gate_tile))
+        gate_silu = gate_tile * gate_sigmoid
+        
+        # Apply SwiGLU: SiLU(gate) * value
+        swiglu_result = gate_silu * value_tile
+        
+        # Store back the SwiGLU result in the gate projection buffer to save memory
+        gate_proj[:, i_start:i_start+BLOCK_N] = swiglu_result
+    
+    # Initialize accumulator for output
+    output = tl.zeros([BLOCK_SIZE, hidden_size], dtype=tl.float32)
+    
+    # Step 2: Compute FC2(gate_proj) -> [BLOCK_SIZE, hidden_size]
+    # Now gate_proj contains the SwiGLU result
+    for i_start in range(0, intermediate_size, BLOCK_K):
+        # Compute number of valid intermediate dimensions
+        valid_inter_k = min(BLOCK_K, intermediate_size - i_start)
+        
+        # Get SwiGLU result tile
+        swiglu_tile = gate_proj[:, i_start:i_start+BLOCK_K]
+        
+        # Process hidden dimension in tiles
+        for h_start in range(0, hidden_size, BLOCK_N):
+            # Compute number of valid hidden dimensions
+            valid_hidden_n = min(BLOCK_N, hidden_size - h_start)
+            
+            # Load weight tile for FC2 [BLOCK_K, BLOCK_N]
+            fc2_weight_tile_ptr = fc2_weight_ptr + i_start * fc2_weight_col_stride + h_start * fc2_weight_row_stride
+            fc2_weight_mask = (tl.arange(0, BLOCK_K)[:, None] < valid_inter_k) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+            fc2_weight_tile = tl.load(
+                fc2_weight_tile_ptr + tl.arange(0, BLOCK_K)[:, None] * fc2_weight_col_stride + 
+                tl.arange(0, BLOCK_N)[None, :] * fc2_weight_row_stride,
+                mask=fc2_weight_mask,
+                other=0.0
+            )
+            
+            # Compute partial FC2: [BLOCK_SIZE, BLOCK_K] x [BLOCK_K, BLOCK_N] -> [BLOCK_SIZE, BLOCK_N]
+            partial_fc2 = tl.dot(swiglu_tile, fc2_weight_tile)
+            
+            # Accumulate result to output buffer
+            output_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+            output[:, h_start:h_start+BLOCK_N] += partial_fc2
+    
+    # Apply FC2 bias if using bias
+    if USE_BIAS:
+        # Load bias for FC2
+        for h_start in range(0, hidden_size, BLOCK_N):
+            valid_hidden_n = min(BLOCK_N, hidden_size - h_start)
+            fc2_bias_mask = tl.arange(0, BLOCK_N) < valid_hidden_n
+            fc2_bias_tile = tl.load(
+                fc2_bias_ptr + h_start + tl.arange(0, BLOCK_N),
+                mask=fc2_bias_mask,
+                other=0.0
+            )
+            
+            # Add bias to output
+            output_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+            output[:, h_start:h_start+BLOCK_N] = output[:, h_start:h_start+BLOCK_N] + fc2_bias_tile[None, :]
+    
+    # Store final output
+    for h_start in range(0, hidden_size, BLOCK_N):
+        valid_hidden_n = min(BLOCK_N, hidden_size - h_start)
+        output_mask = (tl.arange(0, BLOCK_SIZE)[:, None] < valid_seq_len) & (tl.arange(0, BLOCK_N)[None, :] < valid_hidden_n)
+        
+        # Get output tile
+        output_tile = output[:, h_start:h_start+BLOCK_N]
+        
+        # Store output tile
+        tl.store(
+            output_block_ptr + tl.arange(0, BLOCK_SIZE)[:, None] * output_row_stride + 
+            (h_start + tl.arange(0, BLOCK_N)[None, :]) * output_col_stride,
+            output_tile,
+            mask=output_mask
+        )
+
+
+#-----------------------------------------------------------------------------
+# Python Wrapper Functions
+#-----------------------------------------------------------------------------
+
 def triton_fused_mlp(
     hidden_states: torch.Tensor,
     fc1_weight: torch.Tensor,
     fc1_bias: Optional[torch.Tensor],
     fc2_weight: torch.Tensor,
     fc2_bias: Optional[torch.Tensor],
-    activation_fn: str = "gelu"
+    activation: str = "gelu",
+    fc1_gate_weight: Optional[torch.Tensor] = None,
+    fc1_gate_bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """
-    Fused MLP implementation using Triton kernels.
+    Compute fused MLP operation using optimized Triton kernels.
     
     Args:
         hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size]
-        fc1_weight: Weight tensor for first linear layer
-        fc1_bias: Optional bias tensor for first linear layer
-        fc2_weight: Weight tensor for second linear layer
-        fc2_bias: Optional bias tensor for second linear layer
-        activation_fn: Activation function to use ("gelu", "relu", etc.)
+        fc1_weight: Weight tensor for first linear layer [intermediate_size, hidden_size]
+        fc1_bias: Optional bias tensor for first linear layer [intermediate_size]
+        fc2_weight: Weight tensor for second linear layer [hidden_size, intermediate_size]
+        fc2_bias: Optional bias tensor for second linear layer [hidden_size]
+        activation: Activation function to use: "gelu", "relu", or "swiglu"
+        fc1_gate_weight: Optional gate weight for SwiGLU [intermediate_size, hidden_size]
+        fc1_gate_bias: Optional gate bias for SwiGLU [intermediate_size]
         
     Returns:
         Output tensor of shape [batch_size, seq_len, hidden_size]
     """
+    # Handle potential missing Triton
+    if not hasattr(triton, "runtime") or not triton.runtime.driver.is_initialized():
+        return pytorch_fused_mlp(
+            hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias, 
+            activation, fc1_gate_weight, fc1_gate_bias
+        )
+    
+    # Extract dimensions
     batch_size, seq_len, hidden_size = hidden_states.shape
     intermediate_size = fc1_weight.shape[0]
     
-    # We need to handle both bias and no-bias cases
+    # Determine whether to use bias
     use_bias = fc1_bias is not None and fc2_bias is not None
     
-    # If bias is None, create zero tensors for the kernel
+    # Create zero tensors for bias if not provided
     if fc1_bias is None:
         fc1_bias = torch.zeros(intermediate_size, device=hidden_states.device, dtype=hidden_states.dtype)
     if fc2_bias is None:
         fc2_bias = torch.zeros(hidden_size, device=hidden_states.device, dtype=hidden_states.dtype)
     
-    # Initialize output tensor
-    output = torch.empty((batch_size, seq_len, hidden_size), device=hidden_states.device, dtype=hidden_states.dtype)
+    # Create output tensor
+    output = torch.empty_like(hidden_states)
     
-    # Compute meta-parameters for the kernel
-    block_size = 16
-    block_k = 16
-    block_n = 16
+    # Determine the block sizes based on model dimensions
+    # These block sizes can be tuned for specific hardware and model architectures
+    BLOCK_SIZE = min(64, seq_len)
+    BLOCK_K = min(32, hidden_size)
+    BLOCK_N = min(32, intermediate_size)
     
-    # Calculate grid dimensions
+    # Grid dimensions for kernel launch
     grid = (
         batch_size,
-        triton.cdiv(seq_len, block_size),
-        triton.cdiv(intermediate_size, block_n)
+        triton.cdiv(seq_len, BLOCK_SIZE)
     )
     
-    # Choose the appropriate kernel based on the activation function
-    if activation_fn == "gelu":
-        fused_dense_gelu_dense_kernel[grid](
+    # Launch the appropriate kernel based on the activation function
+    if activation == "gelu":
+        _fused_mlp_gelu_kernel[grid](
             hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias, output,
             batch_size, seq_len, hidden_size, intermediate_size,
             hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
             fc1_weight.stride(0), fc1_weight.stride(1),
             fc2_weight.stride(0), fc2_weight.stride(1),
             output.stride(0), output.stride(1), output.stride(2),
-            block_size=block_size, block_k=block_k, block_n=block_n,
-            USE_BIAS=use_bias,
+            BLOCK_SIZE=BLOCK_SIZE, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
+            USE_BIAS=use_bias
         )
-    elif activation_fn == "relu":
-        fused_dense_relu_dense_kernel[grid](
+    elif activation == "relu":
+        _fused_mlp_relu_kernel[grid](
             hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias, output,
             batch_size, seq_len, hidden_size, intermediate_size,
             hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
             fc1_weight.stride(0), fc1_weight.stride(1),
             fc2_weight.stride(0), fc2_weight.stride(1),
             output.stride(0), output.stride(1), output.stride(2),
-            block_size=block_size, block_k=block_k, block_n=block_n,
-            USE_BIAS=use_bias,
+            BLOCK_SIZE=BLOCK_SIZE, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
+            USE_BIAS=use_bias
+        )
+    elif activation == "swiglu":
+        # SwiGLU requires both gate and value projections
+        if fc1_gate_weight is None or (use_bias and fc1_gate_bias is None):
+            raise ValueError("SwiGLU activation requires gate weights and bias (if bias is used)")
+            
+        # Create zero tensors for gate bias if not provided but use_bias is True
+        if use_bias and fc1_gate_bias is None:
+            fc1_gate_bias = torch.zeros(intermediate_size, device=hidden_states.device, dtype=hidden_states.dtype)
+        
+        _fused_mlp_swiglu_kernel[grid](
+            hidden_states, fc1_gate_weight, fc1_gate_bias, fc1_weight, fc1_bias,
+            fc2_weight, fc2_bias, output,
+            batch_size, seq_len, hidden_size, intermediate_size,
+            hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
+            fc1_gate_weight.stride(0), fc1_gate_weight.stride(1),
+            fc1_weight.stride(0), fc1_weight.stride(1),
+            fc2_weight.stride(0), fc2_weight.stride(1),
+            output.stride(0), output.stride(1), output.stride(2),
+            BLOCK_SIZE=BLOCK_SIZE, BLOCK_K=BLOCK_K, BLOCK_N=BLOCK_N,
+            USE_BIAS=use_bias
         )
     else:
-        raise ValueError(f"Unsupported activation function: {activation_fn}")
+        raise ValueError(f"Unsupported activation function: {activation}")
     
     return output
 
 
-def triton_fused_bias_gelu(
-    hidden_states: torch.Tensor,
-    bias: torch.Tensor
-) -> torch.Tensor:
-    """
-    Fused bias addition and GELU activation using Triton kernels.
-    
-    Args:
-        hidden_states: Input tensor
-        bias: Bias tensor
-        
-    Returns:
-        Output tensor after bias addition and GELU activation
-    """
-    # Flatten the input for kernel processing
-    input_flat = hidden_states.reshape(-1)
-    n_elements = input_flat.numel()
-    
-    # Prepare output tensor
-    output = torch.empty_like(input_flat)
-    
-    # Compute meta-parameters for the kernel
-    block_size = 1024
-    
-    # Calculate grid dimensions
-    grid = (triton.cdiv(n_elements, block_size),)
-    
-    # Launch kernel
-    fused_bias_gelu_kernel[grid](
-        input_flat, bias, output,
-        n_elements,
-        block_size=block_size,
-    )
-    
-    # Reshape output back to original shape
-    return output.reshape(hidden_states.shape)
-
-
-def triton_fused_swiglu(
-    hidden_states: torch.Tensor,
-    w1: torch.Tensor,
-    w2: torch.Tensor,
-    b1: Optional[torch.Tensor] = None,
-    b2: Optional[torch.Tensor] = None
-) -> torch.Tensor:
-    """
-    Fused SwiGLU computation using Triton kernels.
-    
-    Args:
-        hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size]
-        w1: Weight tensor for gate projection
-        w2: Weight tensor for value projection
-        b1: Optional bias tensor for gate projection
-        b2: Optional bias tensor for value projection
-        
-    Returns:
-        Output tensor after SwiGLU activation
-    """
-    batch_size, seq_len, hidden_size = hidden_states.shape
-    intermediate_size = w1.shape[0]
-    
-    # We need to handle both bias and no-bias cases
-    use_bias = b1 is not None and b2 is not None
-    
-    # If bias is None, create zero tensors for the kernel
-    if b1 is None:
-        b1 = torch.zeros(intermediate_size, device=hidden_states.device, dtype=hidden_states.dtype)
-    if b2 is None:
-        b2 = torch.zeros(intermediate_size, device=hidden_states.device, dtype=hidden_states.dtype)
-    
-    # Initialize output tensor
-    output = torch.empty((batch_size, seq_len, intermediate_size), device=hidden_states.device, dtype=hidden_states.dtype)
-    
-    # Compute meta-parameters for the kernel
-    block_size = 16
-    block_k = 16
-    
-    # Calculate grid dimensions
-    grid = (
-        batch_size,
-        triton.cdiv(seq_len, block_size),
-    )
-    
-    # Launch kernel
-    fused_bias_swiglu_kernel[grid](
-        hidden_states, w1, w2, b1, b2, output,
-        batch_size, seq_len, hidden_size, intermediate_size,
-        hidden_states.stride(0), hidden_states.stride(1), hidden_states.stride(2),
-        w1.stride(0), w1.stride(1),
-        output.stride(0), output.stride(1), output.stride(2),
-        block_size=block_size, block_k=block_k,
-        USE_BIAS=use_bias,
-    )
-    
-    return output
-
-
-# Create the wrapper function for the module
-def fused_mlp_forward(
+def pytorch_fused_mlp(
     hidden_states: torch.Tensor,
     fc1_weight: torch.Tensor,
     fc1_bias: Optional[torch.Tensor],
     fc2_weight: torch.Tensor,
     fc2_bias: Optional[torch.Tensor],
     activation: str = "gelu",
-    fuse_bias_gelu: bool = True,
-    dropout_prob: float = 0.0,
-    checkpoint_activation: bool = False,
     fc1_gate_weight: Optional[torch.Tensor] = None,
-    fc1_gate_bias: Optional[torch.Tensor] = None,
+    fc1_gate_bias: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
     """
-    Main entry point for fused MLP operations in the FusedMLP module.
+    PyTorch implementation of fused MLP (used when Triton is not available).
     
     Args:
-        hidden_states: Input tensor
-        fc1_weight: Weight tensor for first linear layer
-        fc1_bias: Bias tensor for first linear layer
-        fc2_weight: Weight tensor for second linear layer
-        fc2_bias: Bias tensor for second linear layer
-        activation: Activation function to use ("gelu", "relu", "swiglu")
-        fuse_bias_gelu: Whether to fuse bias addition with activation
-        dropout_prob: Dropout probability (not yet implemented in Triton kernels)
-        checkpoint_activation: Whether to checkpoint activations (not yet implemented in Triton kernels)
-        fc1_gate_weight: Optional gate weight tensor for SwiGLU
-        fc1_gate_bias: Optional gate bias tensor for SwiGLU
+        Same as triton_fused_mlp
         
     Returns:
-        Output tensor after MLP transformation
+        Output tensor of shape [batch_size, seq_len, hidden_size]
     """
-    # Check if we have the FC1 gate projections for SwiGLU
-    has_swiglu_gates = fc1_gate_weight is not None
+    # Step 1: FC1 projection
+    fc1_output = torch.nn.functional.linear(hidden_states, fc1_weight, fc1_bias)
     
-    # Handle SwiGLU separately since it has a different structure
-    if activation == "swiglu" and has_swiglu_gates:
-        # Use specialized SwiGLU implementation
-        intermediate = triton_fused_swiglu(
-            hidden_states,
-            fc1_gate_weight, fc1_weight,
-            fc1_gate_bias, fc1_bias
-        )
+    # Step 2: Apply activation
+    if activation == "gelu":
+        fc1_output = torch.nn.functional.gelu(fc1_output)
+    elif activation == "relu":
+        fc1_output = torch.nn.functional.relu(fc1_output)
+    elif activation == "swiglu":
+        if fc1_gate_weight is None:
+            raise ValueError("SwiGLU activation requires gate weights")
         
-        # Apply the output projection manually for now
-        # TODO: Fuse this into the SwiGLU kernel
-        return torch.nn.functional.linear(intermediate, fc2_weight, fc2_bias)
+        # Compute gate and value projections
+        gate_output = torch.nn.functional.linear(hidden_states, fc1_gate_weight, fc1_gate_bias)
+        
+        # Apply SwiGLU: SiLU(gate) * value
+        # SiLU(x) = x * sigmoid(x)
+        gate_output = gate_output * torch.sigmoid(gate_output)  # SiLU activation
+        fc1_output = gate_output * fc1_output  # Element-wise multiplication
+    else:
+        raise ValueError(f"Unsupported activation function: {activation}")
     
-    # For GELU and ReLU, use the fused MLP implementation
-    return triton_fused_mlp(
-        hidden_states,
-        fc1_weight, fc1_bias,
-        fc2_weight, fc2_bias,
-        activation_fn=activation
-    )
-
-# Expose the SwiGLU support flag
-fused_mlp_forward.supports_swiglu = True
+    # Step 3: FC2 projection
+    output = torch.nn.functional.linear(fc1_output, fc2_weight, fc2_bias)
+    
+    return output
 
 
-# Benchmarking functions
+#-----------------------------------------------------------------------------
+# Benchmarking Functions
+#-----------------------------------------------------------------------------
+
 def benchmark_fused_mlp(
-    batch_size: int = 8,
-    seq_len: int = 512,
-    hidden_size: int = 768,
-    intermediate_size: int = 3072,
-    activation_fn: str = "gelu",
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation: str = "gelu",
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float16,
     num_warmup: int = 10,
     num_iter: int = 100
 ) -> Dict[str, float]:
     """
-    Benchmark the performance of the fused MLP implementations.
+    Benchmark the performance of the fused MLP implementation.
     
     Args:
         batch_size: Batch size
         seq_len: Sequence length
         hidden_size: Hidden size
         intermediate_size: Intermediate size
-        activation_fn: Activation function to use
+        activation: Activation function to use
+        device: Device to run benchmark on
+        dtype: Data type for benchmark
         num_warmup: Number of warmup iterations
-        num_iter: Number of iterations to measure
+        num_iter: Number of benchmark iterations
         
     Returns:
-        Dictionary with timing results
+        Dictionary with benchmark results
     """
-    import time
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, skipping benchmark")
+        return {
+            "batch_size": batch_size,
+            "seq_len": seq_len,
+            "hidden_size": hidden_size,
+            "intermediate_size": intermediate_size,
+            "activation": activation,
+            "triton_time_ms": 0.0,
+            "pytorch_time_ms": 0.0,
+            "speedup": 0.0
+        }
     
-    # Create inputs
-    hidden_states = torch.randn((batch_size, seq_len, hidden_size), device="cuda", dtype=torch.float16)
-    fc1_weight = torch.randn((intermediate_size, hidden_size), device="cuda", dtype=torch.float16)
-    fc1_bias = torch.randn((intermediate_size,), device="cuda", dtype=torch.float16)
-    fc2_weight = torch.randn((hidden_size, intermediate_size), device="cuda", dtype=torch.float16)
-    fc2_bias = torch.randn((hidden_size,), device="cuda", dtype=torch.float16)
+    # Create test tensors
+    hidden_states = torch.randn((batch_size, seq_len, hidden_size), device=device, dtype=dtype)
+    fc1_weight = torch.randn((intermediate_size, hidden_size), device=device, dtype=dtype)
+    fc1_bias = torch.randn((intermediate_size,), device=device, dtype=dtype)
+    fc2_weight = torch.randn((hidden_size, intermediate_size), device=device, dtype=dtype)
+    fc2_bias = torch.randn((hidden_size,), device=device, dtype=dtype)
     
-    # Add gate for SwiGLU if needed
-    if activation_fn == "swiglu":
-        fc1_gate_weight = torch.randn((intermediate_size, hidden_size), device="cuda", dtype=torch.float16)
-        fc1_gate_bias = torch.randn((intermediate_size,), device="cuda", dtype=torch.float16)
+    # Create gate weights for SwiGLU if needed
+    if activation == "swiglu":
+        fc1_gate_weight = torch.randn((intermediate_size, hidden_size), device=device, dtype=dtype)
+        fc1_gate_bias = torch.randn((intermediate_size,), device=device, dtype=dtype)
     else:
         fc1_gate_weight = None
         fc1_gate_bias = None
     
-    # Warmup
+    # Warm up
     for _ in range(num_warmup):
-        _ = fused_mlp_forward(
+        # PyTorch implementation
+        _ = pytorch_fused_mlp(
             hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias,
-            activation=activation_fn, fc1_gate_weight=fc1_gate_weight, fc1_gate_bias=fc1_gate_bias
+            activation, fc1_gate_weight, fc1_gate_bias
         )
+        
+        # Triton implementation
+        if hasattr(triton, "runtime") and triton.runtime.driver.is_initialized():
+            _ = triton_fused_mlp(
+                hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias,
+                activation, fc1_gate_weight, fc1_gate_bias
+            )
     
-    # Synchronize before timing
-    torch.cuda.synchronize()
-    
-    # Time the fused MLP
+    # Benchmark PyTorch implementation
+    torch.cuda.synchronize() if device == "cuda" else None
     start_time = time.time()
+    
     for _ in range(num_iter):
-        _ = fused_mlp_forward(
+        _ = pytorch_fused_mlp(
             hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias,
-            activation=activation_fn, fc1_gate_weight=fc1_gate_weight, fc1_gate_bias=fc1_gate_bias
+            activation, fc1_gate_weight, fc1_gate_bias
         )
-    torch.cuda.synchronize()
-    fused_time = (time.time() - start_time) / num_iter * 1000  # ms
+    
+    torch.cuda.synchronize() if device == "cuda" else None
+    pytorch_time = (time.time() - start_time) * 1000 / num_iter  # ms
+    
+    # Benchmark Triton implementation
+    if hasattr(triton, "runtime") and triton.runtime.driver.is_initialized():
+        torch.cuda.synchronize() if device == "cuda" else None
+        start_time = time.time()
+        
+        for _ in range(num_iter):
+            _ = triton_fused_mlp(
+                hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias,
+                activation, fc1_gate_weight, fc1_gate_bias
+            )
+        
+        torch.cuda.synchronize() if device == "cuda" else None
+        triton_time = (time.time() - start_time) * 1000 / num_iter  # ms
+        
+        speedup = pytorch_time / triton_time
+    else:
+        triton_time = pytorch_time
+        speedup = 1.0
     
     return {
-        "fused_mlp_time_ms": fused_time,
         "batch_size": batch_size,
         "seq_len": seq_len,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
-        "activation_fn": activation_fn,
+        "activation": activation,
+        "triton_time_ms": triton_time,
+        "pytorch_time_ms": pytorch_time,
+        "speedup": speedup
     }
 
 
-def compare_with_standard_mlp(
-    batch_size: int = 8,
-    seq_len: int = 512,
-    hidden_size: int = 768,
-    intermediate_size: int = 3072,
-    activation_fn: str = "gelu",
-    num_warmup: int = 10,
-    num_iter: int = 100
+def validate_fused_mlp(
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation: str = "gelu",
+    device: str = "cuda",
+    dtype: torch.dtype = torch.float16
 ) -> Dict[str, float]:
     """
-    Compare the performance of fused MLP with standard PyTorch implementation.
+    Validate the correctness of the fused MLP implementation.
     
     Args:
         batch_size: Batch size
         seq_len: Sequence length
         hidden_size: Hidden size
         intermediate_size: Intermediate size
-        activation_fn: Activation function to use
-        num_warmup: Number of warmup iterations
-        num_iter: Number of iterations to measure
+        activation: Activation function to use
+        device: Device to run validation on
+        dtype: Data type for validation
         
     Returns:
-        Dictionary with timing results and speedup
+        Dictionary with validation results
     """
-    import time
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, skipping validation")
+        return {
+            "is_correct": False,
+            "max_diff": 0.0
+        }
     
-    # Create inputs
-    hidden_states = torch.randn((batch_size, seq_len, hidden_size), device="cuda", dtype=torch.float16)
-    fc1_weight = torch.randn((intermediate_size, hidden_size), device="cuda", dtype=torch.float16)
-    fc1_bias = torch.randn((intermediate_size,), device="cuda", dtype=torch.float16)
-    fc2_weight = torch.randn((hidden_size, intermediate_size), device="cuda", dtype=torch.float16)
-    fc2_bias = torch.randn((hidden_size,), device="cuda", dtype=torch.float16)
+    # Create test tensors
+    hidden_states = torch.randn((batch_size, seq_len, hidden_size), device=device, dtype=dtype)
+    fc1_weight = torch.randn((intermediate_size, hidden_size), device=device, dtype=dtype)
+    fc1_bias = torch.randn((intermediate_size,), device=device, dtype=dtype)
+    fc2_weight = torch.randn((hidden_size, intermediate_size), device=device, dtype=dtype)
+    fc2_bias = torch.randn((hidden_size,), device=device, dtype=dtype)
     
-    # Create standard PyTorch implementation
-    class StandardMLP(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.fc1 = torch.nn.Linear(hidden_size, intermediate_size)
-            self.fc2 = torch.nn.Linear(intermediate_size, hidden_size)
-            
-            # Initialize with same weights
-            self.fc1.weight.data.copy_(fc1_weight)
-            self.fc1.bias.data.copy_(fc1_bias)
-            self.fc2.weight.data.copy_(fc2_weight)
-            self.fc2.bias.data.copy_(fc2_bias)
-            
-        def forward(self, x):
-            if activation_fn == "gelu":
-                return self.fc2(torch.nn.functional.gelu(self.fc1(x)))
-            elif activation_fn == "relu":
-                return self.fc2(torch.nn.functional.relu(self.fc1(x)))
-            else:
-                raise ValueError(f"Unsupported activation: {activation_fn}")
-    
-    mlp = StandardMLP().cuda().half()
-    
-    # Add gate for SwiGLU if needed
-    if activation_fn == "swiglu":
-        fc1_gate_weight = torch.randn((intermediate_size, hidden_size), device="cuda", dtype=torch.float16)
-        fc1_gate_bias = torch.randn((intermediate_size,), device="cuda", dtype=torch.float16)
+    # Create gate weights for SwiGLU if needed
+    if activation == "swiglu":
+        fc1_gate_weight = torch.randn((intermediate_size, hidden_size), device=device, dtype=dtype)
+        fc1_gate_bias = torch.randn((intermediate_size,), device=device, dtype=dtype)
     else:
         fc1_gate_weight = None
         fc1_gate_bias = None
     
-    # Warmup standard implementation
-    for _ in range(num_warmup):
-        _ = mlp(hidden_states)
+    # Compute with PyTorch implementation
+    pytorch_output = pytorch_fused_mlp(
+        hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias,
+        activation, fc1_gate_weight, fc1_gate_bias
+    )
     
-    # Synchronize before timing
-    torch.cuda.synchronize()
-    
-    # Time the standard MLP
-    start_time = time.time()
-    for _ in range(num_iter):
-        _ = mlp(hidden_states)
-    torch.cuda.synchronize()
-    standard_time = (time.time() - start_time) / num_iter * 1000  # ms
-    
-    # Warmup fused implementation
-    for _ in range(num_warmup):
-        _ = fused_mlp_forward(
+    # Compute with Triton implementation
+    if hasattr(triton, "runtime") and triton.runtime.driver.is_initialized():
+        triton_output = triton_fused_mlp(
             hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias,
-            activation=activation_fn, fc1_gate_weight=fc1_gate_weight, fc1_gate_bias=fc1_gate_bias
+            activation, fc1_gate_weight, fc1_gate_bias
         )
-    
-    # Synchronize before timing
-    torch.cuda.synchronize()
-    
-    # Time the fused MLP
-    start_time = time.time()
-    for _ in range(num_iter):
-        _ = fused_mlp_forward(
-            hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias,
-            activation=activation_fn, fc1_gate_weight=fc1_gate_weight, fc1_gate_bias=fc1_gate_bias
-        )
-    torch.cuda.synchronize()
-    fused_time = (time.time() - start_time) / num_iter * 1000  # ms
-    
-    # Calculate speedup
-    speedup = standard_time / fused_time
+        
+        # Compare outputs
+        max_diff = torch.max(torch.abs(pytorch_output - triton_output)).item()
+        is_correct = max_diff < 1e-3
+    else:
+        # If Triton is not available, we compare with ourselves (should be equal)
+        max_diff = 0.0
+        is_correct = True
     
     return {
-        "standard_mlp_time_ms": standard_time,
-        "fused_mlp_time_ms": fused_time,
-        "speedup": speedup,
+        "is_correct": is_correct,
+        "max_diff": max_diff,
         "batch_size": batch_size,
         "seq_len": seq_len,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
-        "activation_fn": activation_fn,
+        "activation": activation
     }
 
 
-def memory_usage_comparison(
-    batch_size: int = 8,
-    seq_len: int = 512,
-    hidden_size: int = 768,
-    intermediate_size: int = 3072
-) -> Dict[str, int]:
+def profile_memory_usage(
+    batch_size: int,
+    seq_len: int,
+    hidden_size: int,
+    intermediate_size: int,
+    activation: str = "gelu",
+    device: str = "cuda"
+) -> Dict[str, float]:
     """
-    Compare memory usage between standard and fused MLP implementations.
+    Profile memory usage of the fused MLP implementation.
     
     Args:
         batch_size: Batch size
         seq_len: Sequence length
         hidden_size: Hidden size
         intermediate_size: Intermediate size
+        activation: Activation function to use
+        device: Device to run profiling on
         
     Returns:
         Dictionary with memory usage statistics
     """
-    # Calculate theoretical memory usage
-    hidden_states_size = batch_size * seq_len * hidden_size * 2  # 2 bytes for fp16
-    intermediate_states_size = batch_size * seq_len * intermediate_size * 2  # 2 bytes for fp16
+    if device == "cuda" and not torch.cuda.is_available():
+        print("CUDA not available, skipping memory profiling")
+        return {
+            "pytorch_memory_mb": 0.0,
+            "triton_memory_mb": 0.0,
+            "memory_saving_mb": 0.0,
+            "memory_saving_percent": 0.0
+        }
     
-    # Standard implementation memory usage (peak)
-    # It needs to store:
-    # 1. Input hidden states
-    # 2. Intermediate activation after first FC
-    # 3. Intermediate activation after activation function
-    # 4. Output hidden states
-    standard_memory = hidden_states_size + intermediate_states_size * 2 + hidden_states_size
+    # Create test tensors
+    hidden_states = torch.randn((batch_size, seq_len, hidden_size), device=device)
+    fc1_weight = torch.randn((intermediate_size, hidden_size), device=device)
+    fc1_bias = torch.randn((intermediate_size,), device=device)
+    fc2_weight = torch.randn((hidden_size, intermediate_size), device=device)
+    fc2_bias = torch.randn((hidden_size,), device=device)
     
-    # Fused implementation memory usage (peak)
-    # It only needs to store:
-    # 1. Input hidden states
-    # 2. Output hidden states
-    # (Intermediate results are kept in registers/shared memory)
-    fused_memory = hidden_states_size + hidden_states_size
+    # Create gate weights for SwiGLU if needed
+    if activation == "swiglu":
+        fc1_gate_weight = torch.randn((intermediate_size, hidden_size), device=device)
+        fc1_gate_bias = torch.randn((intermediate_size,), device=device)
+    else:
+        fc1_gate_weight = None
+        fc1_gate_bias = None
+    
+    # Reset memory stats
+    if device == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+    
+    # Run PyTorch implementation
+    _ = pytorch_fused_mlp(
+        hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias,
+        activation, fc1_gate_weight, fc1_gate_bias
+    )
+    
+    # Measure memory usage
+    if device == "cuda":
+        pytorch_memory = torch.cuda.max_memory_allocated() / (1024 ** 2)  # MB
+        torch.cuda.reset_peak_memory_stats()
+        torch.cuda.empty_cache()
+    else:
+        pytorch_memory = 0.0
+    
+    # Run Triton implementation
+    if hasattr(triton, "runtime") and triton.runtime.driver.is_initialized():
+        _ = triton_fused_mlp(
+            hidden_states, fc1_weight, fc1_bias, fc2_weight, fc2_bias,
+            activation, fc1_gate_weight, fc1_gate_bias
+        )
+        
+        # Measure memory usage
+        if device == "cuda":
+            triton_memory = torch.cuda.max_memory_allocated() / (1024 ** 2)  # MB
+        else:
+            triton_memory = 0.0
+    else:
+        triton_memory = pytorch_memory
     
     # Calculate memory savings
-    memory_saved = standard_memory - fused_memory
-    memory_reduction_percent = (memory_saved / standard_memory) * 100
+    memory_saving = pytorch_memory - triton_memory
+    memory_saving_percent = (memory_saving / pytorch_memory) * 100 if pytorch_memory > 0 else 0.0
     
     return {
-        "standard_memory_bytes": standard_memory,
-        "fused_memory_bytes": fused_memory,
-        "memory_saved_bytes": memory_saved,
-        "memory_reduction_percent": memory_reduction_percent,
+        "pytorch_memory_mb": pytorch_memory,
+        "triton_memory_mb": triton_memory,
+        "memory_saving_mb": memory_saving,
+        "memory_saving_percent": memory_saving_percent,
         "batch_size": batch_size,
         "seq_len": seq_len,
         "hidden_size": hidden_size,
         "intermediate_size": intermediate_size,
+        "activation": activation
     }
