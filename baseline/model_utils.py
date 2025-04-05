@@ -9,6 +9,10 @@ from typing import Dict, List, Tuple, Set, Any, Optional, Union, Callable
 import torch
 import torch.nn as nn
 from torch.nn.modules.module import _IncompatibleKeys
+import logging
+import torch.nn.functional as F
+import types
+from copy import deepcopy
 
 
 def get_model_size(model: nn.Module) -> Dict[str, int]:
@@ -589,4 +593,167 @@ def freeze_layers(model: nn.Module, layer_names: List[str]) -> nn.Module:
             frozen_count += 1
     
     print(f"Froze {frozen_count} parameters")
+    return model
+
+
+# Add a new function to integrate PagedAttention with a Hugging Face model
+def add_paged_attention_to_model(model: nn.Module) -> nn.Module:
+    """
+    Modifies a Hugging Face model to use PagedAttention for KV cache management.
+    This patches the model's layers to use our triton_reshape_and_cache kernel
+    and integrate with PagedKVCache.
+    
+    Args:
+        model: PyTorch model (typically from HuggingFace transformers)
+        
+    Returns:
+        Modified model with PagedAttention patches
+    """
+    try:
+        from ..kernels.triton.attention_kernels import (
+            triton_reshape_and_cache, triton_paged_attention_forward, TRITON_AVAILABLE
+        )
+    except ImportError:
+        logging.warning("Triton PagedAttention kernels not available. Cannot add PagedAttention to model.")
+        return model
+    
+    if not TRITON_AVAILABLE:
+        logging.warning("Triton not available. Cannot add PagedAttention to model.")
+        return model
+    
+    # Deep copy model to avoid modifying original
+    model = deepcopy(model)
+    
+    # Add a method to handle PagedKVCache at the model level
+    def set_paged_kv_cache(self, paged_kv_cache):
+        """Store reference to PagedKVCache for use during inference."""
+        self._paged_kv_cache = paged_kv_cache
+        
+    # Add the new method to the model
+    model.set_paged_kv_cache = types.MethodType(set_paged_kv_cache, model)
+    
+    # Temporary flag we set when patching the forward method to avoid recursion
+    patching_in_progress = False
+    
+    # Patch the forward method of attention layers to use PagedAttention
+    # We need to identify the attention layers based on common patterns
+    for name, module in model.named_modules():
+        # Check for common attention layer implementations
+        is_attention_layer = (
+            # Class name contains 'attention'
+            any(pattern in module.__class__.__name__.lower() for pattern in ["attention", "attn"]) or
+            # Has Q/K/V projections (common HF pattern)
+            (hasattr(module, "q_proj") and hasattr(module, "k_proj") and hasattr(module, "v_proj")) or
+            # Has QKV projection (common for some models like GPT-2)
+            hasattr(module, "c_attn") or
+            # Specific attribute patterns
+            hasattr(module, "query") and hasattr(module, "key") and hasattr(module, "value")
+        )
+        
+        if is_attention_layer:
+            # Save reference to original forward method
+            original_forward = module.forward
+            
+            # Create patched forward method that intercepts calls
+            def patched_forward(self, *args, **kwargs):
+                nonlocal patching_in_progress
+                # Avoid recursion
+                if patching_in_progress:
+                    return original_forward(*args, **kwargs)
+                
+                patching_in_progress = True
+                try:
+                    # Check if PagedAttention params are present in kwargs
+                    if (
+                        "block_tables" in kwargs and 
+                        "context_lengths" in kwargs and
+                        "physical_kv_cache_k" in kwargs and 
+                        "physical_kv_cache_v" in kwargs
+                    ):
+                        # Get required arguments
+                        hidden_states = args[0] if args else kwargs.get("hidden_states")
+                        layer_idx = kwargs.get("layer_idx")
+                        
+                        # For many HF models during generation, hidden_states is just the new token
+                        batch_size, seq_len, hidden_dim = hidden_states.shape
+                        
+                        # Determine if we need to populate K/V cache
+                        # When generating, we need to write K/V for the new token to the cache
+                        # Note: This assumes reshape_and_cache has been imported 
+                        if hasattr(self, "k_proj") and hasattr(self, "v_proj"):
+                            # Common pattern: Separate q_proj, k_proj, v_proj
+                            # Compute key and value projections
+                            k = self.k_proj(hidden_states)
+                            v = self.v_proj(hidden_states)
+                            
+                            # Apply rotary embeddings if present (commonly used in LLaMA, etc.)
+                            if hasattr(self, "rotary_emb") and kwargs.get("position_ids") is not None:
+                                pos_ids = kwargs.get("position_ids")
+                                cos, sin = self.rotary_emb(v, seq_len=seq_len)
+                                # Most implementations apply rotary only to k (not q yet)
+                                k = self.rotary_emb.apply_rotary_pos_emb(k, cos, sin, pos_ids)
+                            
+                            # Reshape for cache - Add heads dimension
+                            # Determine if model uses GQA/MQA or standard attention
+                            num_kv_heads = getattr(self, "num_key_value_heads", 
+                                                  getattr(self, "num_heads", 
+                                                         getattr(self, "num_attention_heads", None)))
+                            head_dim = hidden_dim // num_kv_heads
+                            
+                            # Reshape to [batch_size, seq_len, num_kv_heads, head_dim]
+                            k = k.view(batch_size, seq_len, num_kv_heads, head_dim)
+                            v = v.view(batch_size, seq_len, num_kv_heads, head_dim)
+                            
+                            # Write K/V to cache using the kernel
+                            triton_reshape_and_cache(
+                                key=k,
+                                value=v,
+                                k_cache=kwargs["physical_kv_cache_k"],
+                                v_cache=kwargs["physical_kv_cache_v"],
+                                block_tables=kwargs["block_tables"],
+                                context_lengths=kwargs["context_lengths"],
+                                layer_idx=layer_idx if layer_idx is not None else 0
+                            )
+                        elif hasattr(self, "c_attn"):
+                            # GPT-2 pattern: Fused QKV projection via c_attn
+                            # Compute QKV projections
+                            qkv = self.c_attn(hidden_states)
+                            
+                            # Split QKV
+                            hidden_size = qkv.shape[-1] // 3
+                            q, k, v = qkv.split(hidden_size, dim=-1)
+                            
+                            # Reshape for cache
+                            num_heads = getattr(self, "num_heads", hidden_size // 64) # Default for GPT-2
+                            head_dim = hidden_size // num_heads
+                            
+                            # Reshape to [batch_size, seq_len, num_heads, head_dim]
+                            k = k.view(batch_size, seq_len, num_heads, head_dim)
+                            v = v.view(batch_size, seq_len, num_heads, head_dim)
+                            
+                            # Write K/V to cache
+                            triton_reshape_and_cache(
+                                key=k,
+                                value=v,
+                                k_cache=kwargs["physical_kv_cache_k"],
+                                v_cache=kwargs["physical_kv_cache_v"],
+                                block_tables=kwargs["block_tables"],
+                                context_lengths=kwargs["context_lengths"],
+                                layer_idx=layer_idx if layer_idx is not None else 0
+                            )
+                        
+                        # Call the model's own forward, with all the original arguments
+                        # This will eventually use our modified FlashAttention with 
+                        # paged_attention_forward if block_tables are present
+                        return original_forward(*args, **kwargs)
+                    
+                    # Standard forward pass (original behavior) if no PagedAttention params
+                    return original_forward(*args, **kwargs)
+                finally:
+                    patching_in_progress = False
+                    
+            # Bind the patched method to this specific module instance
+            module.forward = types.MethodType(patched_forward, module)
+            
+    logging.info("Added PagedAttention to model.")
     return model

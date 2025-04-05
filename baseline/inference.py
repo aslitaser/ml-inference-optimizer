@@ -1037,51 +1037,348 @@ class KVCache:
         }
 
 
+# Import our utility function
+from .model_utils import add_paged_attention_to_model
+import math # For ceil in BlockManager
+
+# Add BlockManager, SequenceMetadata and PagedKVCache classes
+class BlockManager:
+    """
+    Manages the allocation and freeing of physical memory blocks for the KV cache.
+    Implements reference counting for block sharing.
+    """
+    def __init__(self, num_blocks: int, block_size: int, num_layers: int, num_heads: int, head_dim: int, dtype: torch.dtype, device: str):
+        """
+        Initializes the BlockManager.
+
+        Args:
+            num_blocks: Total number of physical blocks available.
+            block_size: Size of each block (number of tokens).
+            num_layers: Number of transformer layers.
+            num_heads: Number of attention heads.
+            head_dim: Dimension of each attention head.
+            dtype: Data type for cache tensors.
+            device: Device to store tensors on.
+        """
+        self.num_blocks = num_blocks
+        self.block_size = block_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.device = device
+
+        # Pool of free block indices
+        self.free_blocks = list(range(num_blocks))
+        # Reference count for each block (block_idx -> count)
+        self.ref_counts = torch.zeros(num_blocks, dtype=torch.int32, device=device)
+
+        # Pre-allocate physical K/V cache blocks
+        self.gpu_cache_k = torch.zeros(
+            (num_blocks, num_layers, block_size, num_heads, head_dim),
+            dtype=dtype, device=device
+        )
+        self.gpu_cache_v = torch.zeros(
+            (num_blocks, num_layers, block_size, num_heads, head_dim),
+            dtype=dtype, device=device
+        )
+        
+        self.is_initialized = True
+        logging.info(f"BlockManager initialized with {num_blocks} blocks.")
+
+
+    def allocate_block(self) -> int:
+        """Allocates a free physical block."""
+        if not self.free_blocks:
+            raise MemoryError("Out of memory: No free blocks available in KV cache.")
+        block_idx = self.free_blocks.pop()
+        self.ref_counts[block_idx] = 1 # Initial reference count
+        # logging.debug(f"Allocated block {block_idx}. Free blocks remaining: {len(self.free_blocks)}")
+        return block_idx
+
+    def free_block(self, block_idx: int) -> None:
+        """Decrements the reference count of a block and frees it if count reaches zero."""
+        if self.ref_counts[block_idx] <= 0:
+             logging.warning(f"Attempting to free block {block_idx} with ref count {self.ref_counts[block_idx]}.")
+             return # Already freed or invalid state
+
+        self.ref_counts[block_idx] -= 1
+        if self.ref_counts[block_idx] == 0:
+            self.free_blocks.append(block_idx)
+            # logging.debug(f"Freed block {block_idx}. Free blocks available: {len(self.free_blocks)}")
+
+    def increase_ref_count(self, block_idx: int) -> None:
+        """Increases the reference count for a shared block."""
+        if self.ref_counts[block_idx] <= 0:
+             raise ValueError(f"Cannot increase ref count for unallocated block {block_idx}.")
+        self.ref_counts[block_idx] += 1
+
+    def get_num_free_blocks(self) -> int:
+        """Returns the number of currently free blocks."""
+        return len(self.free_blocks)
+
+    def get_physical_block(self, block_idx: int, layer_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns the physical K and V tensors for a given block index and layer."""
+        return self.gpu_cache_k[block_idx, layer_idx], self.gpu_cache_v[block_idx, layer_idx]
+
+    def get_physical_caches(self) -> Tuple[torch.Tensor, torch.Tensor]:
+         """Returns the entire physical K and V cache tensors."""
+         return self.gpu_cache_k, self.gpu_cache_v
+
+
+class SequenceMetadata:
+    """Holds metadata for a single sequence in the PagedAttention KV Cache."""
+    def __init__(self, seq_id: int):
+        self.seq_id = seq_id
+        self.logical_len = 0
+        # List of physical block indices allocated to this sequence
+        self.block_table: List[int] = []
+
+    def append_block(self, block_idx: int):
+        """Adds a block to the sequence's block table."""
+        self.block_table.append(block_idx)
+
+    def get_last_block_physical_idx(self) -> Optional[int]:
+        """Returns the physical index of the last block in the table."""
+        return self.block_table[-1] if self.block_table else None
+
+    def __len__(self) -> int:
+        """Returns the number of blocks allocated to this sequence."""
+        return len(self.block_table)
+
+
+class PagedKVCache:
+    """
+    Paged Key-Value cache using a BlockManager for memory allocation.
+    Manages logical block tables for multiple sequences.
+    """
+    def __init__(self, num_blocks: int, block_size: int, num_layers: int, num_heads: int, head_dim: int,
+                 dtype: torch.dtype = torch.float16, device: str = "cuda"):
+        """
+        Initializes the PagedKVCache.
+
+        Args:
+            num_blocks: Total number of physical blocks to manage.
+            block_size: Size of each block (number of tokens).
+            num_layers: Number of transformer layers.
+            num_heads: Number of attention heads.
+            head_dim: Dimension of each attention head.
+            dtype: Data type for cache tensors.
+            device: Device to store tensors on.
+        """
+        self.block_manager = BlockManager(num_blocks, block_size, num_layers, num_heads, head_dim, dtype, device)
+        self.block_size = block_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.dtype = dtype
+        self.device = device
+
+        # Maps sequence ID to its metadata (including block table)
+        self.sequences: Dict[int, SequenceMetadata] = {}
+        # TODO: Implement prefix caching mechanism
+        self.prefix_cache: Dict[Tuple[int, ...], List[int]] = {} # prefix_tuple -> list of shared block_indices
+
+        logging.info(f"PagedKVCache initialized. Block size: {block_size}, Num blocks: {num_blocks}")
+
+    def _ensure_sequence_exists(self, seq_id: int):
+        """Creates metadata for a sequence if it doesn't exist."""
+        if seq_id not in self.sequences:
+            self.sequences[seq_id] = SequenceMetadata(seq_id)
+
+    def _get_logical_block_idx(self, token_pos: int) -> int:
+        """Calculates the logical block index for a given token position."""
+        return token_pos // self.block_size
+
+    def _get_block_offset(self, token_pos: int) -> int:
+        """Calculates the offset within a block for a given token position."""
+        return token_pos % self.block_size
+
+    def allocate_blocks_for_sequence(self, seq_id: int, num_tokens: int):
+        """Allocates initial blocks for a new sequence or extends an existing one."""
+        self._ensure_sequence_exists(seq_id)
+        seq_meta = self.sequences[seq_id]
+
+        current_num_blocks = len(seq_meta)
+        required_num_blocks = math.ceil(num_tokens / self.block_size)
+
+        # TODO: Implement prefix caching check here
+        # If prefix matches, reuse blocks and increase ref counts
+
+        # Allocate new blocks if needed
+        for _ in range(required_num_blocks - current_num_blocks):
+            try:
+                new_block_idx = self.block_manager.allocate_block()
+                seq_meta.append_block(new_block_idx)
+            except MemoryError as e:
+                logging.error(f"Failed to allocate block for seq {seq_id}: {e}")
+                # TODO: Need strategy for handling OOM (e.g., preemption)
+                self.free_sequence(seq_id) # Free whatever was allocated for this seq
+                raise e # Re-raise
+
+        seq_meta.logical_len = num_tokens
+        logging.debug(f"Allocated blocks for seq {seq_id}. New block table: {seq_meta.block_table}, Logical length: {num_tokens}")
+
+
+    def append_token(self, seq_id: int) -> None:
+         """
+         Appends a single token slot to the sequence, allocating a new block if necessary.
+         This is typically called before the forward pass for the next token.
+         """
+         self._ensure_sequence_exists(seq_id)
+         seq_meta = self.sequences[seq_id]
+         new_logical_len = seq_meta.logical_len + 1
+
+         # Check if the new token position requires a new block
+         current_block_idx = self._get_logical_block_idx(seq_meta.logical_len -1 if seq_meta.logical_len > 0 else 0)
+         new_block_idx = self._get_logical_block_idx(new_logical_len - 1)
+
+         if new_block_idx > current_block_idx or not seq_meta.block_table:
+             # Need to allocate a new block
+             try:
+                 new_physical_block_idx = self.block_manager.allocate_block()
+                 seq_meta.append_block(new_physical_block_idx)
+                 # logging.debug(f"Appended block {new_physical_block_idx} to seq {seq_id} for token {new_logical_len}.")
+             except MemoryError as e:
+                 logging.error(f"Failed to allocate block for seq {seq_id} during append: {e}")
+                 self.free_sequence(seq_id)
+                 raise e
+
+         seq_meta.logical_len = new_logical_len
+
+
+    def get_block_table(self, seq_id: int) -> List[int]:
+        """Returns the block table (list of physical block indices) for a sequence."""
+        if seq_id not in self.sequences:
+             raise ValueError(f"Sequence {seq_id} not found in cache.")
+        return self.sequences[seq_id].block_table
+
+    def get_sequence_length(self, seq_id: int) -> int:
+        """Returns the current logical length of the sequence."""
+        if seq_id not in self.sequences:
+            return 0
+        return self.sequences[seq_id].logical_len
+
+    def free_sequence(self, seq_id: int) -> None:
+        """Frees all blocks associated with a completed or preempted sequence."""
+        if seq_id in self.sequences:
+            seq_meta = self.sequences[seq_id]
+            # logging.debug(f"Freeing sequence {seq_id} with block table: {seq_meta.block_table}")
+            for block_idx in seq_meta.block_table:
+                self.block_manager.free_block(block_idx)
+            del self.sequences[seq_id]
+        else:
+            logging.warning(f"Attempted to free non-existent sequence {seq_id}")
+
+    def get_physical_caches(self) -> Tuple[torch.Tensor, torch.Tensor]:
+         """Returns the underlying physical K and V cache tensors."""
+         return self.block_manager.get_physical_caches()
+
+    def get_memory_usage(self) -> Dict[str, float]:
+        """Get memory usage statistics for the cache."""
+        total_blocks = self.block_manager.num_blocks
+        free_blocks = self.block_manager.get_num_free_blocks()
+        used_blocks = total_blocks - free_blocks
+
+        # Calculate physical memory used by the cache tensors
+        k_mem = self.block_manager.gpu_cache_k.element_size() * self.block_manager.gpu_cache_k.nelement()
+        v_mem = self.block_manager.gpu_cache_v.element_size() * self.block_manager.gpu_cache_v.nelement()
+        total_physical_mem_mb = (k_mem + v_mem) / (1024 * 1024)
+
+        # Calculate logical memory represented by allocated blocks
+        allocated_tokens = used_blocks * self.block_size
+        # Note: This doesn't account for internal fragmentation within the last block of each sequence
+
+        return {
+            "total_physical_blocks": total_blocks,
+            "free_physical_blocks": free_blocks,
+            "used_physical_blocks": used_blocks,
+            "block_size": self.block_size,
+            "total_physical_memory_mb": total_physical_mem_mb,
+            "gpu_cache_k_shape": tuple(self.block_manager.gpu_cache_k.shape),
+            "gpu_cache_v_shape": tuple(self.block_manager.gpu_cache_v.shape),
+            "memory_efficiency": free_blocks / total_blocks if total_blocks > 0 else 1.0,
+            "active_sequences": len(self.sequences)
+        }
+
+
+# Update the TransformerInferenceRunner.__init__ to use PagedKVCache
 class TransformerInferenceRunner(InferenceRunner):
     """Specialized inference runner for transformer models."""
-    
-    def __init__(self, model: nn.Module, device: str, precision: str = "fp16", 
+
+    def __init__(self, model: nn.Module, device: str, precision: str = "fp16",
                  is_encoder_decoder: bool = False, use_kv_cache: bool = True,
-                 use_cuda_graph: bool = False):
+                 use_cuda_graph: bool = False,
+                 # PagedAttention specific parameters
+                 use_paged_attention: bool = True,
+                 kv_cache_num_gpu_blocks: Optional[int] = None, # Total blocks on GPU
+                 kv_cache_block_size: int = 16):
         """
         Initialize transformer inference runner.
-        
+
         Args:
             model: Transformer model to run inference with
             device: Device to run inference on ('cuda', 'cpu')
             precision: Precision to use for inference ('fp32', 'fp16', 'bf16', 'int8', 'int4')
             is_encoder_decoder: Whether the model is an encoder-decoder architecture
-            use_kv_cache: Whether to use KV cache for efficient generation
+            use_kv_cache: Whether to use KV cache for efficient generation 
             use_cuda_graph: Whether to use CUDA graph for optimized execution
+            use_paged_attention: Whether to use PagedAttention (more efficient than standard KV cache)
+            kv_cache_num_gpu_blocks: Total number of physical GPU blocks for the KV cache. If None, calculated based on available memory.
+            kv_cache_block_size: Size (in tokens) of each block in the KV cache.
         """
         super().__init__(model, device, precision)
         self.is_encoder_decoder = is_encoder_decoder
         self.use_kv_cache = use_kv_cache and device == "cuda"
         self.use_cuda_graph = use_cuda_graph and device == "cuda"
-        
+        self.use_paged_attention = use_paged_attention and use_kv_cache and device == "cuda"
+        self.kv_cache_block_size = kv_cache_block_size
+
+        try:
+            # Import PagedAttention kernel functions to check availability
+            from ..kernels.triton.attention_kernels import triton_paged_attention_forward, TRITON_AVAILABLE
+            # If importing fails, we'll catch the ImportError and disable PagedAttention
+            self.triton_available = TRITON_AVAILABLE
+        except ImportError:
+            self.triton_available = False
+            if self.use_paged_attention:
+                logging.warning("Triton not available. PagedAttention will be disabled.")
+                self.use_paged_attention = False
+
         # Initialize KV cache
-        self.kv_cache = None
+        self.kv_cache = None  # Legacy KV cache
+        self.paged_kv_cache = None  # New paged KV cache
+        
         if self.use_kv_cache:
-            self.kv_cache = KVCache(max_batch_size=1, max_seq_len=2048)
-            self._initialize_kv_cache()
+            if self.use_paged_attention and self.triton_available:
+                # Placeholder: We initialize the paged_kv_cache in _initialize_kv_cache after detecting model params
+                self.kv_cache_num_gpu_blocks = kv_cache_num_gpu_blocks  # Store for later initialization
+                
+                # Apply the PagedAttention model modifications to the model
+                self.model = add_paged_attention_to_model(self.model)
+            else:
+                # Fallback to legacy KV cache
+                self.kv_cache = KVCache(max_batch_size=1, max_seq_len=2048)
             
+            # Actual initialization happens in _initialize_kv_cache after model params are known
+            self._detect_model_params()  # Try detecting params early
+            self._initialize_kv_cache()  # Initialize based on detected params
+
         # CUDA graph support
         self.cuda_graph = None
         self.static_input = None
         self.static_output = None
-        
-    def _initialize_kv_cache(self) -> None:
-        """Initialize the KV cache with model parameters."""
-        if not self.use_kv_cache or self.kv_cache is None:
-            return
-            
-        # Detect model architecture and extract parameters
-        try:
+
+
+    def _detect_model_params(self):
+         """Detects model parameters needed for KV cache initialization."""
+         # (This logic is moved from the original _initialize_kv_cache)
+         try:
             # Try to get parameters from various model types
             num_layers = 0
             num_heads = 0
             head_dim = 0
-            
+
             # For HuggingFace models
             if hasattr(self.model, 'config'):
                 config = self.model.config
@@ -1089,194 +1386,175 @@ class TransformerInferenceRunner(InferenceRunner):
                 num_heads = getattr(config, 'num_attention_heads', 0) or getattr(config, 'n_head', 0)
                 hidden_size = getattr(config, 'hidden_size', 0) or getattr(config, 'n_embd', 0)
                 head_dim = hidden_size // num_heads if num_heads > 0 else 0
-                
-            # For PyTorch transformer models
-            if num_layers == 0 and hasattr(self.model, 'encoder') and hasattr(self.model.encoder, 'layers'):
-                num_layers = len(self.model.encoder.layers)
-                # Try to get num_heads from first layer
-                if len(self.model.encoder.layers) > 0:
-                    if hasattr(self.model.encoder.layers[0], 'self_attn'):
-                        if hasattr(self.model.encoder.layers[0].self_attn, 'num_heads'):
-                            num_heads = self.model.encoder.layers[0].self_attn.num_heads
-                            
-            # If still not found, try to examine model structure
-            if num_heads == 0 or head_dim == 0:
-                # Look for attention modules
-                for module in self.model.modules():
-                    # PyTorch MultiheadAttention
-                    if isinstance(module, nn.MultiheadAttention):
-                        num_heads = getattr(module, 'num_heads', 0)
-                        embed_dim = getattr(module, 'embed_dim', 0)
-                        head_dim = embed_dim // num_heads if num_heads > 0 else 0
-                        break
-                    # Custom attention with attributes
-                    elif hasattr(module, 'num_heads') and hasattr(module, 'head_dim'):
-                        num_heads = module.num_heads
-                        head_dim = module.head_dim
-                        break
-                    # Models like T5 with different naming
-                    elif hasattr(module, 'n_heads') and hasattr(module, 'd_kv'):
-                        num_heads = module.n_heads
-                        head_dim = module.d_kv
-                        break
-                        
-            # If layers still not found, try to count layers
+                # Handle grouped query attention (GQA/MQA)
+                num_kv_heads = getattr(config, 'num_key_value_heads', num_heads)
+                if num_kv_heads != num_heads:
+                     logging.info(f"Detected Grouped Query Attention (GQA/MQA): num_heads={num_heads}, num_kv_heads={num_kv_heads}")
+                     # The cache usually stores K/V for num_kv_heads
+                     num_heads = num_kv_heads # Store num_kv_heads in self.num_heads for cache allocation
+
+            # Fallback detection logic (simplified from original)
+            if num_layers == 0 or num_heads == 0 or head_dim == 0:
+                 logging.warning("Using fallback model parameter detection for KV Cache.")
+                 for module in self.model.modules():
+                     if isinstance(module, nn.MultiheadAttention):
+                         num_heads = getattr(module, 'num_heads', num_heads)
+                         embed_dim = getattr(module, 'embed_dim', 0)
+                         head_dim = embed_dim // num_heads if num_heads > 0 else head_dim
+                         # Assume num_layers based on module depth or name (crude)
+                         break
+                     elif hasattr(module, 'num_heads') and hasattr(module, 'head_dim'):
+                          num_heads = getattr(module, 'num_heads', num_heads)
+                          head_dim = getattr(module, 'head_dim', head_dim)
+                          num_kv_heads = getattr(module, 'num_key_value_heads', num_heads)
+                          if num_kv_heads != num_heads:
+                              num_heads = num_kv_heads # GQA/MQA
+                          break
+
+            # Count layers if still unknown
             if num_layers == 0:
                 layers_count = 0
-                layers_pattern = re.compile(r'layer\.\d+$|layers\.\d+$|layer_\d+$|h\.\d+$')
+                # More robust layer detection needed, depends on model structure conventions
+                # Example: looking for 'transformer.h' in GPT-NeoX, 'model.layers' in Llama, etc.
+                layers_pattern = re.compile(r'(?:transformer\.h|model\.layers|encoder\.layer|decoder\.layer)\.\d+')
                 for name, _ in self.model.named_modules():
                     if layers_pattern.search(name):
-                        layers_count += 1
-                num_layers = layers_count
-                
+                        # Extract the number to avoid double counting nested modules
+                        try:
+                            layer_num = int(name.split('.')[-1])
+                            layers_count = max(layers_count, layer_num + 1)
+                        except ValueError:
+                            pass # Should probably count unique layer containers
+                if layers_count > 0:
+                     num_layers = layers_count
+                else: # Last resort default
+                     logging.warning("Could not detect number of layers reliably. Defaulting to 24.")
+                     num_layers = 24
+
             # Set defaults if detection failed
-            if num_layers == 0:
-                logging.warning("Could not detect number of layers. Defaulting to 24.")
-                num_layers = 24
-            if num_heads == 0:
-                logging.warning("Could not detect number of heads. Defaulting to 16.")
-                num_heads = 16
-            if head_dim == 0:
-                logging.warning("Could not detect head dimension. Defaulting to 64.")
-                head_dim = 64
-                
-            # Initialize the cache
-            dtype = next(self.model.parameters()).dtype
-            self.kv_cache.initialize(num_layers, num_heads, head_dim, dtype, self.device)
-            
-        except Exception as e:
-            logging.warning(f"Failed to initialize KV cache: {e}")
-            self.use_kv_cache = False
-            
-    def _forward(self, inputs: Any, **kwargs) -> Any:
-        """
-        Run forward pass on transformer model.
-        
-        Args:
-            inputs: Model inputs (typically a dict with input_ids and attention_mask)
-            **kwargs: Additional arguments like max_length, num_beams, etc.
-            
-        Returns:
-            Model outputs
-        """
-        # Check if inputs is a dict with input_ids or just tensor input_ids
-        if isinstance(inputs, dict):
-            input_dict = inputs
-        elif hasattr(inputs, "to_dict") and callable(inputs.to_dict):
-            # Handle BatchEncoding objects from tokenizers
-            input_dict = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
-                          for k, v in inputs.to_dict().items()}
-        else:
-            # Assume it's just input_ids
-            input_dict = {"input_ids": inputs}
-            if "attention_mask" not in input_dict and "attention_mask" not in kwargs:
-                # Create attention mask if not provided
-                input_dict["attention_mask"] = torch.ones_like(input_dict["input_ids"])
-        
-        # Merge kwargs into input_dict for any keys not already present
-        for key, value in kwargs.items():
-            if key not in input_dict:
-                input_dict[key] = value
-        
-        # Handle generation vs normal forward pass
-        generation_args = ["max_length", "min_length", "num_beams", "temperature", 
-                         "top_k", "top_p", "repetition_penalty", "do_sample"]
-        
-        is_generation = any(arg in input_dict for arg in generation_args) or any(arg in kwargs for arg in generation_args)
-        
-        if is_generation and hasattr(self.model, "generate"):
-            # Add KV cache to generation if available
-            if self.use_kv_cache and self.kv_cache and self.kv_cache.is_initialized:
-                # Reset KV cache for new generation
-                self.kv_cache.reset()
-                
-                # Add KV cache to input_dict for models that support it
-                # Note: Different model architectures handle KV cache differently
-                # This is a simplified approach - actual implementation depends on model
-                input_dict["use_cache"] = True
-                
-                # For models that support custom KV cache
-                if hasattr(self.model, "set_kv_cache"):
-                    self.model.set_kv_cache(self.kv_cache)
-                    
-            # Use CUDA graph for generation if available
-            if self.use_cuda_graph and self.cuda_graph is not None and torch.cuda.is_available():
-                # Only use CUDA graph for single token generation in a fixed pattern
-                # Real implementation would need multiple graphs for different scenarios
-                if input_dict.get("max_length", 0) == input_dict["input_ids"].shape[1] + 1:
-                    return self._forward_cuda_graph(input_dict)
-            
-            # Extract generation-specific parameters
-            gen_kwargs = {k: v for k, v in input_dict.items() 
-                         if k in generation_args or k in ["input_ids", "attention_mask", "use_cache"]}
-            outputs = self.model.generate(**gen_kwargs)
-        else:
-            # Regular forward pass
-            outputs = self.model(**input_dict)
-            
-        return outputs
-        
-    def _forward_cuda_graph(self, inputs: Dict[str, Any]) -> Any:
-        """
-        Run forward pass using CUDA graph for optimized execution.
-        
-        Args:
-            inputs: Dictionary of inputs to the model
-            
-        Returns:
-            Model outputs
-        """
+            if num_heads == 0: logging.warning("Could not detect number of heads. Defaulting to 16."); num_heads = 16
+            if head_dim == 0: logging.warning("Could not detect head dimension. Defaulting to 64."); head_dim = 64
+
+            self.num_layers = num_layers
+            self.num_heads = num_heads # Stores num_kv_heads if GQA/MQA detected
+            self.head_dim = head_dim
+            logging.info(f"Detected model parameters: Layers={num_layers}, Heads (KV)={num_heads}, Head Dim={head_dim}")
+
+         except Exception as e:
+            logging.error(f"Failed to detect model parameters for KV cache: {e}")
+            self.use_kv_cache = False # Disable cache if params unknown
+
+
+    def _calculate_num_gpu_blocks(self) -> int:
+        """Calculates the number of GPU blocks based on available memory and model params."""
         if not torch.cuda.is_available():
-            return self.model(**inputs)
-            
-        # Check if we need to capture a graph
-        if self.cuda_graph is None:
-            # Create static inputs and outputs for graph capture
-            static_inputs = {
-                k: v.clone() if isinstance(v, torch.Tensor) else v
-                for k, v in inputs.items()
-            }
-            
-            # Warmup before capture
-            for _ in range(3):
-                with torch.no_grad():
-                    _ = self.model(**static_inputs)
-            
-            # Capture graph
-            torch.cuda.synchronize()
-            self.static_input = static_inputs
-            self.static_output = None
-            
-            # Use stream for capture
-            stream = torch.cuda.Stream()
-            stream.wait_stream(torch.cuda.current_stream())
-            
-            with torch.cuda.stream(stream):
-                self.cuda_graph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(self.cuda_graph):
-                    self.static_output = self.model(**self.static_input)
-                    
-            torch.cuda.current_stream().wait_stream(stream)
-            
-        # Copy inputs to static tensors
-        for k, v in inputs.items():
-            if isinstance(v, torch.Tensor) and k in self.static_input:
-                self.static_input[k].copy_(v)
-                
-        # Run the graph
-        self.cuda_graph.replay()
-        
-        # Create a copy of the output to avoid issues with graph replay
-        with torch.no_grad():
-            if isinstance(self.static_output, torch.Tensor):
-                return self.static_output.clone()
-            elif isinstance(self.static_output, tuple):
-                return tuple(x.clone() if isinstance(x, torch.Tensor) else x for x in self.static_output)
-            elif isinstance(self.static_output, dict):
-                return {k: v.clone() if isinstance(v, torch.Tensor) else v for k, v in self.static_output.items()}
-            else:
-                return self.static_output
-                
+            return 0
+
+        # Get model memory usage
+        model_params = sum(p.numel() for p in self.model.parameters())
+        # Estimate model memory (highly dependent on precision, activations etc.)
+        # Assuming fp16/bf16
+        model_mem_bytes = model_params * 2
+        activation_mem_factor = 4 # Rough estimate for activations, depends on sequence length etc.
+        estimated_model_mem_bytes = model_mem_bytes * activation_mem_factor
+
+        # Get total and free GPU memory
+        torch.cuda.empty_cache() # Clear cache before checking
+        total_gpu_mem = torch.cuda.get_device_properties(0).total_memory
+        free_gpu_mem = total_gpu_mem - torch.cuda.memory_allocated(0)
+
+        # Calculate memory available for KV cache (leave some headroom)
+        headroom_fraction = 0.10 # Reserve 10%
+        available_for_cache = free_gpu_mem - estimated_model_mem_bytes
+        available_for_cache -= total_gpu_mem * headroom_fraction
+        available_for_cache = max(0, available_for_cache) # Ensure non-negative
+
+        # Calculate memory per block
+        # Shape: [num_blocks, num_layers, block_size, num_heads, head_dim]
+        # Size of one block: 2(K&V) * num_layers * block_size * num_heads * head_dim * element_size
+        element_size = 2  # For float16
+        mem_per_block = 2 * self.num_layers * self.kv_cache_block_size * self.num_heads * self.head_dim * element_size
+
+        if mem_per_block == 0:
+            return 0
+
+        num_gpu_blocks = int(available_for_cache // mem_per_block)
+
+        logging.info(f"GPU Memory Info: Total={total_gpu_mem/1e9:.2f}GB, Free (before cache)={free_gpu_mem/1e9:.2f}GB")
+        logging.info(f"Estimated Model Memory: {estimated_model_mem_bytes/1e9:.2f}GB")
+        logging.info(f"Memory Available for KV Cache: {available_for_cache/1e9:.2f}GB")
+        logging.info(f"Memory Per Block: {mem_per_block/1e6:.2f}MB")
+        logging.info(f"Calculated GPU Blocks for KV Cache: {num_gpu_blocks}")
+
+        if num_gpu_blocks <= 0:
+             logging.error("Not enough GPU memory available to allocate any KV cache blocks.")
+             return 0
+
+        # Safety check - limit blocks if calculation seems excessive (e.g. >80% of total mem)
+        max_cache_mem = total_gpu_mem * 0.8
+        if num_gpu_blocks * mem_per_block > max_cache_mem:
+             num_gpu_blocks = int(max_cache_mem // mem_per_block)
+             logging.warning(f"Limiting KV cache blocks to {num_gpu_blocks} to stay within 80% memory usage.")
+
+        return num_gpu_blocks
+
+
+    def _initialize_kv_cache(self) -> None:
+        """Initialize the appropriate KV cache based on settings."""
+        if not self.use_kv_cache:
+            return
+
+        # Get model parameters
+        if not hasattr(self, 'num_layers') or not hasattr(self, 'num_heads') or not hasattr(self, 'head_dim'):
+            logging.warning("Model parameters not detected. Cannot initialize KV cache.")
+            self.use_kv_cache = False
+            return
+
+        # Get the data type from model parameters
+        dtype = next(self.model.parameters()).dtype
+        device = self.device
+
+        # Initialize the appropriate KV cache
+        if self.use_paged_attention and self.triton_available:
+            try:
+                # Determine number of blocks
+                if self.kv_cache_num_gpu_blocks is None:
+                     num_gpu_blocks = self._calculate_num_gpu_blocks()
+                     if num_gpu_blocks == 0:
+                          raise MemoryError("Insufficient GPU memory for PagedKVCache.")
+                     self.kv_cache_num_gpu_blocks = num_gpu_blocks
+                else:
+                     num_gpu_blocks = self.kv_cache_num_gpu_blocks
+
+                # Initialize PagedKVCache
+                self.paged_kv_cache = PagedKVCache(
+                    num_blocks=num_gpu_blocks,
+                    block_size=self.kv_cache_block_size,
+                    num_layers=self.num_layers,
+                    num_heads=self.num_heads, # This stores num_kv_heads if GQA/MQA
+                    head_dim=self.head_dim,
+                    dtype=dtype,
+                    device=device
+                )
+                logging.info(f"PagedKVCache initialized successfully with {num_gpu_blocks} blocks.")
+
+                # For models that have a custom method to set the paged KV cache
+                if hasattr(self.model, "set_paged_kv_cache"):
+                    self.model.set_paged_kv_cache(self.paged_kv_cache)
+
+            except Exception as e:
+                logging.error(f"Failed to initialize PagedKVCache: {e}")
+                self.use_paged_attention = False
+                self.paged_kv_cache = None
+                # Fallback to legacy KV cache
+                self.kv_cache = KVCache(max_batch_size=1, max_seq_len=2048)
+                self.kv_cache.initialize(self.num_layers, self.num_heads, self.head_dim, dtype, device)
+        else:
+            # Initialize legacy KV cache
+            if self.kv_cache is not None and not self.kv_cache.is_initialized:
+                self.kv_cache.initialize(self.num_layers, self.num_heads, self.head_dim, dtype, device)
+
+
     def get_kv_cache_stats(self) -> Dict[str, Any]:
         """
         Get statistics about the KV cache.
@@ -1284,84 +1562,33 @@ class TransformerInferenceRunner(InferenceRunner):
         Returns:
             Dictionary with KV cache statistics
         """
-        if not self.use_kv_cache or self.kv_cache is None:
+        if not self.use_kv_cache:
             return {"kv_cache_enabled": False}
-            
-        stats = {"kv_cache_enabled": True}
+
+        # Check if we're using PagedKVCache
+        if self.use_paged_attention and self.paged_kv_cache and self.paged_kv_cache.block_manager.is_initialized:
+            stats = {
+                "kv_cache_enabled": True,
+                "kv_cache_type": "PagedAttention"
+            }
+            # Add memory usage stats specific to PagedKVCache
+            stats.update(self.paged_kv_cache.get_memory_usage())
+            return stats
         
-        # Add memory usage stats
-        stats.update(self.kv_cache.get_memory_usage())
+        # Fallback to original KV cache
+        elif self.kv_cache and self.kv_cache.is_initialized:
+            stats = {
+                "kv_cache_enabled": True,
+                "kv_cache_type": "Standard"
+            }
+            # Add memory usage stats
+            stats.update(self.kv_cache.get_memory_usage())
+            # Add sequence lengths
+            stats["current_seq_lengths"] = self.kv_cache.current_seq_lengths
+            return stats
         
-        # Add sequence lengths
-        stats["current_seq_lengths"] = self.kv_cache.current_seq_lengths
-        
-        return stats
-    
-    def run_inference_with_layer_timing(self, inputs: Any, **kwargs) -> Tuple[Any, Dict[str, float]]:
-        """
-        Run inference with per-layer timing.
-        
-        Args:
-            inputs: Model inputs
-            **kwargs: Additional arguments for the model
-            
-        Returns:
-            Tuple of (model outputs, performance metrics with per-layer timing)
-        """
-        self.model.eval()
-        layer_metrics = {}
-        
-        # Set up hooks for layer timing
-        hooks = []
-        layer_times = {}
-        
-        def forward_hook(name):
-            def hook(module, input, output):
-                # Record start time
-                if self.device == "cuda":
-                    torch.cuda.synchronize()
-                start = time.perf_counter()
-                
-                # Store the start time for this layer
-                layer_times[name] = {"start": start}
-            return hook
-        
-        def backward_hook(name):
-            def hook(module, input, output):
-                # Record end time
-                if self.device == "cuda":
-                    torch.cuda.synchronize()
-                end = time.perf_counter()
-                
-                # Calculate elapsed time
-                if name in layer_times:
-                    start = layer_times[name]["start"]
-                    elapsed_ms = (end - start) * 1000  # Convert to ms
-                    layer_times[name]["time_ms"] = elapsed_ms
-            return hook
-        
-        # Register hooks for all named modules
-        for name, module in self.model.named_modules():
-            if len(list(module.children())) == 0:  # Only register for leaf modules
-                hooks.append(module.register_forward_pre_hook(forward_hook(name)))
-                hooks.append(module.register_forward_hook(backward_hook(name)))
-        
-        # Run normal inference
-        outputs, metrics = self.run_inference(inputs, **kwargs)
-        
-        # Process layer timing data
-        for name, data in layer_times.items():
-            if "time_ms" in data:
-                layer_metrics[f"layer_time_{name}_ms"] = data["time_ms"]
-        
-        # Remove hooks
-        for hook in hooks:
-            hook.remove()
-        
-        # Merge layer metrics with regular metrics
-        combined_metrics = {**metrics, **layer_metrics}
-        
-        return outputs, combined_metrics
+        # KV cache is not initialized
+        return {"kv_cache_enabled": False, "kv_cache_type": "None"}
 
 
 class DiffusionInferenceRunner(InferenceRunner):
