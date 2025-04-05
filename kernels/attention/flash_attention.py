@@ -20,11 +20,12 @@ References:
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union, Set
+from typing import Dict, Optional, Tuple, Union, Set, Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import logging
 
 try:
     import triton
@@ -34,6 +35,19 @@ except ImportError:
     HAS_TRITON = False
 
 from ..triton.flash_attention_kernels import triton_flash_attention, triton_fused_attention
+
+# Attempt to import the paged attention kernel
+try:
+    from ..triton.attention_kernels import triton_paged_attention_forward, TRITON_AVAILABLE
+except ImportError:
+    triton_paged_attention_forward = None
+    # Keep existing TRITON_AVAILABLE check for other kernels
+    try:
+        import triton
+        TRITON_AVAILABLE = True
+    except ImportError:
+        TRITON_AVAILABLE = False
+    logging.warning("Paged Attention Triton kernel not found or Triton is unavailable. PagedAttention will not be usable via FlashAttention modules.")
 
 
 @dataclass
@@ -463,40 +477,52 @@ class FlashAttentionLayer(nn.Module):
     
     This class provides a complete attention layer with QKV projections
     and output projection using the efficient FlashAttention3 algorithm.
+    Can also use PagedAttention Triton kernel if KV cache metadata is provided.
     """
     
     def __init__(
-        self, 
-        hidden_size: int, 
+        self,
+        hidden_size: int,
         num_attention_heads: int,
-        config: Optional[FlashAttentionConfig] = None
+        config: Optional[FlashAttentionConfig] = None,
+        # Added parameter to indicate GQA/MQA for cache interaction
+        num_kv_heads: Optional[int] = None
     ):
         """
         Initialize FlashAttentionLayer.
         
         Args:
             hidden_size: Hidden size of the model
-            num_attention_heads: Number of attention heads
+            num_attention_heads: Number of attention heads (Query heads)
             config: FlashAttention configuration
+            num_kv_heads: Number of Key/Value heads (if different from Query heads for GQA/MQA)
         """
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_attention_heads
         self.head_dim = hidden_size // num_attention_heads
         self.config = config or FlashAttentionConfig()
         
         if hidden_size % num_attention_heads != 0:
             raise ValueError(f"hidden_size {hidden_size} must be divisible by num_attention_heads {num_attention_heads}")
+        if hidden_size % self.num_kv_heads != 0:
+             raise ValueError(f"hidden_size {hidden_size} must be divisible by num_kv_heads {self.num_kv_heads}")
         
         # QKV projections
+        # Note: For GQA/MQA, K and V projections might have different output dimensions
+        # if num_kv_heads != num_attention_heads, but standard Linear is often used
+        # with repetition/grouping happening inside the attention kernel or logic.
+        # The PagedAttention kernel expects K/V cache based on num_kv_heads.
         self.q_proj = nn.Linear(hidden_size, hidden_size)
-        self.k_proj = nn.Linear(hidden_size, hidden_size)
-        self.v_proj = nn.Linear(hidden_size, hidden_size)
+        self.k_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim)
+        self.v_proj = nn.Linear(hidden_size, self.num_kv_heads * self.head_dim)
         
         # Output projection
         self.o_proj = nn.Linear(hidden_size, hidden_size)
         
-        # Flash attention module
+        # Flash attention module (for standard path)
+        # Note: FlashAttention might need adjustments for GQA/MQA if not handled internally
         self.flash_attention = FlashAttention3(self.config)
         
         # Initialize weights
@@ -504,89 +530,133 @@ class FlashAttentionLayer(nn.Module):
         
     def _init_weights(self):
         """Initialize attention weights with appropriate scaling."""
-        nn.init.normal_(self.q_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.k_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.v_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.o_proj.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.q_proj.bias)
-        nn.init.zeros_(self.k_proj.bias)
-        nn.init.zeros_(self.v_proj.bias)
-        nn.init.zeros_(self.o_proj.bias)
+        # Placeholder standard init
+        std = 0.02
+        nn.init.normal_(self.q_proj.weight, mean=0.0, std=std)
+        nn.init.normal_(self.k_proj.weight, mean=0.0, std=std)
+        nn.init.normal_(self.v_proj.weight, mean=0.0, std=std)
+        nn.init.normal_(self.o_proj.weight, mean=0.0, std=std)
+        if self.q_proj.bias is not None: nn.init.zeros_(self.q_proj.bias)
+        if self.k_proj.bias is not None: nn.init.zeros_(self.k_proj.bias)
+        if self.v_proj.bias is not None: nn.init.zeros_(self.v_proj.bias)
+        if self.o_proj.bias is not None: nn.init.zeros_(self.o_proj.bias)
         
     def forward(
-        self, 
-        hidden_states: torch.Tensor, 
-        attention_mask: Optional[torch.Tensor] = None
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        # Add kwargs to accept PagedAttention parameters
+        **kwargs: Any
     ) -> torch.Tensor:
         """
         Forward pass for the flash attention layer.
         
         Args:
             hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size]
-            attention_mask: Optional attention mask of shape [batch_size, seq_len] or
-                           [batch_size, 1, seq_len] or [batch_size, seq_len, seq_len]
-                           
+            attention_mask: Optional attention mask (used only in standard FlashAttention path)
+            **kwargs: Can include PagedAttention parameters:
+                physical_kv_cache_k: Physical K cache tensor.
+                physical_kv_cache_v: Physical V cache tensor.
+                block_tables: Tensor mapping logical block indices to physical block indices.
+                context_lengths: Tensor containing the current length of each sequence.
+                kv_cache_block_size: The number of tokens per physical block.
+                max_seq_len: Maximum sequence length the cache can hold.
+                layer_idx: The layer index for which to compute attention.
+
         Returns:
             output: Output tensor of shape [batch_size, seq_len, hidden_size]
         """
-        batch_size, seq_len, _ = hidden_states.shape
-        
-        # Project inputs to queries, keys, and values
-        q = self.q_proj(hidden_states)
-        k = self.k_proj(hidden_states)
-        v = self.v_proj(hidden_states)
-        
-        # Reshape for multi-head attention
-        q = self._split_heads(q, self.num_attention_heads)
-        k = self._split_heads(k, self.num_attention_heads)
-        v = self._split_heads(v, self.num_attention_heads)
-        
-        # Compute attention with flash attention algorithm
-        context_layer = self.flash_attention(q, k, v, attention_mask)
-        
-        # Reshape back
-        context_layer = self._merge_heads(context_layer, self.num_attention_heads)
-        
-        # Apply output projection
-        output = self.o_proj(context_layer)
-        
-        return output
-    
-    def _split_heads(self, x: torch.Tensor, num_heads: int) -> torch.Tensor:
-        """
-        Reshape tensor from [batch_size, seq_len, hidden_size] to 
-        [batch_size, seq_len, num_heads, head_dim].
-        
-        Args:
-            x: Input tensor
-            num_heads: Number of attention heads
-            
-        Returns:
-            Reshaped tensor
-        """
-        batch_size, seq_len, hidden_size = x.shape
-        head_dim = hidden_size // num_heads
-        
-        x = x.view(batch_size, seq_len, num_heads, head_dim)
-        return x
-    
-    def _merge_heads(self, x: torch.Tensor, num_heads: int) -> torch.Tensor:
-        """
-        Reshape tensor from [batch_size, seq_len, num_heads, head_dim] to
-        [batch_size, seq_len, hidden_size].
-        
-        Args:
-            x: Input tensor
-            num_heads: Number of attention heads
-            
-        Returns:
-            Reshaped tensor
-        """
-        batch_size, seq_len, _, head_dim = x.shape
-        hidden_size = num_heads * head_dim
-        
-        x = x.view(batch_size, seq_len, hidden_size)
-        return x
+        batch_size, q_seq_len, _ = hidden_states.shape
+
+        # --- PagedAttention Path ---
+        if 'block_tables' in kwargs and TRITON_AVAILABLE and triton_paged_attention_forward is not None:
+            # Extract PagedAttention arguments
+            k_cache = kwargs.get('physical_kv_cache_k')
+            v_cache = kwargs.get('physical_kv_cache_v')
+            block_tables = kwargs.get('block_tables')
+            context_lengths = kwargs.get('context_lengths')
+            block_size = kwargs.get('kv_cache_block_size')
+            max_seq_len = kwargs.get('max_seq_len')
+            layer_idx = kwargs.get('layer_idx')
+
+            # Basic validation
+            if not all([k_cache is not None, v_cache is not None, block_tables is not None,
+                        context_lengths is not None, block_size is not None,
+                        max_seq_len is not None, layer_idx is not None]):
+                raise ValueError("Missing required arguments for PagedAttention in FlashAttentionLayer forward pass.")
+
+            # Project query
+            q = self.q_proj(hidden_states)
+            # Reshape query: [batch_size, q_seq_len, hidden_size] -> [batch_size, num_heads, q_seq_len, head_dim]
+            q = q.view(batch_size, q_seq_len, self.num_attention_heads, self.head_dim).permute(0, 2, 1, 3)
+
+            # NOTE: K and V are NOT computed from hidden_states here.
+            # They are read directly from the cache by the kernel.
+            # We only need to ensure the cache is populated correctly *before* this call.
+            # (This happens in the model's main forward loop after computing hidden states)
+
+            # Allocate output tensor
+            output = torch.empty_like(q)
+
+            # Call PagedAttention Triton kernel
+            # The kernel expects K/V cache with num_kv_heads
+            # Ensure k_cache, v_cache were allocated with self.num_kv_heads
+            triton_paged_attention_forward(
+                query=q,
+                output=output,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                block_tables=block_tables,
+                context_lengths=context_lengths,
+                block_size=block_size,
+                max_seq_len=max_seq_len,
+                layer_idx=layer_idx
+            )
+
+            # Reshape output: [batch_size, num_heads, q_seq_len, head_dim] -> [batch_size, q_seq_len, hidden_size]
+            output = output.permute(0, 2, 1, 3).contiguous().view(batch_size, q_seq_len, self.hidden_size)
+
+            # Apply output projection
+            final_output = self.o_proj(output)
+            return final_output
+
+        # --- Standard FlashAttention Path ---
+        else:
+            if 'block_tables' in kwargs:
+                 logging.warning("PagedAttention arguments provided but Triton kernel is unavailable/disabled. Falling back to standard FlashAttention.")
+
+            # Project inputs to queries, keys, and values
+            q = self.q_proj(hidden_states)
+            k = self.k_proj(hidden_states)
+            v = self.v_proj(hidden_states)
+
+            # Reshape for multi-head attention
+            # Query: [batch, q_seq, num_q_heads, head_dim]
+            q = q.view(batch_size, q_seq_len, self.num_attention_heads, self.head_dim)
+             # Key/Value: [batch, kv_seq, num_kv_heads, head_dim] (kv_seq == q_seq here)
+            k = k.view(batch_size, q_seq_len, self.num_kv_heads, self.head_dim)
+            v = v.view(batch_size, q_seq_len, self.num_kv_heads, self.head_dim)
+
+            # TODO: Handle GQA/MQA repetition for standard FlashAttention if needed
+            # Standard flash_attn might expect Q/K/V head numbers to match unless it supports GQA internally.
+            # This might require repeating K/V heads if self.num_kv_heads < self.num_attention_heads
+            # Example (if needed):
+            # if self.num_kv_heads < self.num_attention_heads:
+            #     num_reps = self.num_attention_heads // self.num_kv_heads
+            #     k = k.repeat_interleave(num_reps, dim=2) # Repeat along head dim
+            #     v = v.repeat_interleave(num_reps, dim=2)
+
+            # Compute attention with flash attention algorithm
+            # Input shape expected by FlashAttention3: [batch_size, seqlen, nheads, d]
+            context_layer = self.flash_attention(q, k, v, attention_mask)
+
+            # Reshape back: [batch_size, q_seq_len, num_heads, head_dim] -> [batch_size, q_seq_len, hidden_size]
+            context_layer = context_layer.view(batch_size, q_seq_len, self.hidden_size)
+
+            # Apply output projection
+            output = self.o_proj(context_layer)
+
+            return output
 
 
 class FlashSelfAttention(nn.Module):
@@ -597,38 +667,47 @@ class FlashSelfAttention(nn.Module):
     1. Fused QKV projection
     2. Memory-efficient attention computation
     3. Optimized backward pass
+    Can also use PagedAttention Triton kernel if KV cache metadata is provided.
     """
     
     def __init__(
-        self, 
-        hidden_size: int, 
+        self,
+        hidden_size: int,
         num_attention_heads: int,
-        config: Optional[FlashAttentionConfig] = None
+        config: Optional[FlashAttentionConfig] = None,
+        num_kv_heads: Optional[int] = None # Added for GQA/MQA
     ):
         """
         Initialize FlashSelfAttention.
         
         Args:
             hidden_size: Hidden size of the model
-            num_attention_heads: Number of attention heads
+            num_attention_heads: Number of attention heads (Query heads)
             config: FlashAttention configuration
+            num_kv_heads: Number of Key/Value heads (if different from Query heads for GQA/MQA)
         """
         super().__init__()
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
+        self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_attention_heads
         self.head_dim = hidden_size // num_attention_heads
         self.config = config or FlashAttentionConfig()
         
         if hidden_size % num_attention_heads != 0:
             raise ValueError(f"hidden_size {hidden_size} must be divisible by num_attention_heads {num_attention_heads}")
+        if hidden_size % self.num_kv_heads != 0:
+             raise ValueError(f"hidden_size {hidden_size} must be divisible by num_kv_heads {self.num_kv_heads}")
         
         # Fused QKV projection
-        self.qkv_proj = nn.Linear(hidden_size, 3 * hidden_size)
+        # The output dimension needs to accommodate Q heads + K heads + V heads
+        q_dim = hidden_size # num_attention_heads * head_dim
+        kv_dim = self.num_kv_heads * self.head_dim
+        self.qkv_proj = nn.Linear(hidden_size, q_dim + 2 * kv_dim)
         
         # Output projection
         self.o_proj = nn.Linear(hidden_size, hidden_size)
         
-        # Flash attention module
+        # Flash attention module (for standard path)
         self.flash_attention = FlashAttention3(self.config)
         
         # Initialize weights
@@ -636,108 +715,167 @@ class FlashSelfAttention(nn.Module):
         
     def _init_weights(self):
         """Initialize attention weights with appropriate scaling."""
-        nn.init.normal_(self.qkv_proj.weight, mean=0.0, std=0.02)
-        nn.init.normal_(self.o_proj.weight, mean=0.0, std=0.02)
-        nn.init.zeros_(self.qkv_proj.bias)
-        nn.init.zeros_(self.o_proj.bias)
+        # Placeholder standard init
+        std = 0.02
+        nn.init.normal_(self.qkv_proj.weight, mean=0.0, std=std)
+        nn.init.normal_(self.o_proj.weight, mean=0.0, std=std)
+        if self.qkv_proj.bias is not None: nn.init.zeros_(self.qkv_proj.bias)
+        if self.o_proj.bias is not None: nn.init.zeros_(self.o_proj.bias)
         
     def forward(
-        self, 
-        hidden_states: torch.Tensor, 
-        attention_mask: Optional[torch.Tensor] = None
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+         # Add kwargs to accept PagedAttention parameters
+        **kwargs: Any
     ) -> torch.Tensor:
         """
         Forward pass for flash self-attention.
         
         Args:
             hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size]
-            attention_mask: Optional attention mask
-            
+            attention_mask: Optional attention mask (used only in standard FlashAttention path)
+            **kwargs: Can include PagedAttention parameters (see FlashAttentionLayer).
+
         Returns:
             output: Output tensor of shape [batch_size, seq_len, hidden_size]
         """
-        batch_size, seq_len, _ = hidden_states.shape
-        
-        # Use either triton fused attention kernel if available or regular method
-        if self.config.use_triton and HAS_TRITON and hasattr(self, '_forward_triton_fused'):
-            return self._forward_triton_fused(hidden_states, attention_mask)
-        
-        # Project and prepare QKV
-        q, k, v = self._prepare_qkv(hidden_states)
-        
-        # Compute attention with flash attention algorithm
-        context_layer = self.flash_attention(q, k, v, attention_mask)
-        
-        # Reshape back
-        context_layer = self._merge_heads(context_layer, self.num_attention_heads)
-        
-        # Apply output projection
-        output = self.o_proj(context_layer)
-        
-        return output
-    
+        batch_size, q_seq_len, _ = hidden_states.shape
+
+        # --- PagedAttention Path ---
+        if 'block_tables' in kwargs and TRITON_AVAILABLE and triton_paged_attention_forward is not None:
+            # Extract PagedAttention arguments
+            k_cache = kwargs.get('physical_kv_cache_k')
+            v_cache = kwargs.get('physical_kv_cache_v')
+            block_tables = kwargs.get('block_tables')
+            context_lengths = kwargs.get('context_lengths')
+            block_size = kwargs.get('kv_cache_block_size')
+            max_seq_len = kwargs.get('max_seq_len')
+            layer_idx = kwargs.get('layer_idx')
+
+            # Basic validation
+            if not all([k_cache is not None, v_cache is not None, block_tables is not None,
+                        context_lengths is not None, block_size is not None,
+                        max_seq_len is not None, layer_idx is not None]):
+                raise ValueError("Missing required arguments for PagedAttention in FlashSelfAttention forward pass.")
+
+            # Project QKV (we only need Q for the kernel input)
+            qkv = self.qkv_proj(hidden_states)
+            q_dim = self.hidden_size
+            kv_dim = self.num_kv_heads * self.head_dim
+            q = qkv[:, :, :q_dim]
+            # k = qkv[:, :, q_dim:q_dim + kv_dim] # Not needed for kernel input
+            # v = qkv[:, :, q_dim + kv_dim:]       # Not needed for kernel input
+
+            # Reshape query: [batch_size, q_seq_len, hidden_size] -> [batch_size, num_heads, q_seq_len, head_dim]
+            q = q.view(batch_size, q_seq_len, self.num_attention_heads, self.head_dim).permute(0, 2, 1, 3)
+
+            # Allocate output tensor
+            output = torch.empty_like(q)
+
+            # Call PagedAttention Triton kernel
+            triton_paged_attention_forward(
+                query=q,
+                output=output,
+                k_cache=k_cache,
+                v_cache=v_cache,
+                block_tables=block_tables,
+                context_lengths=context_lengths,
+                block_size=block_size,
+                max_seq_len=max_seq_len,
+                layer_idx=layer_idx
+            )
+
+            # Reshape output: [batch_size, num_heads, q_seq_len, head_dim] -> [batch_size, q_seq_len, hidden_size]
+            output = output.permute(0, 2, 1, 3).contiguous().view(batch_size, q_seq_len, self.hidden_size)
+
+            # Apply output projection
+            final_output = self.o_proj(output)
+            return final_output
+
+        # --- Standard FlashAttention Path ---
+        else:
+            if 'block_tables' in kwargs:
+                 logging.warning("PagedAttention arguments provided but Triton kernel is unavailable/disabled. Falling back to standard FlashAttention.")
+
+            # Use either triton fused attention kernel if available or regular method
+            # Note: _forward_triton_fused might need updates for GQA/MQA if not handled by the kernel
+            if self.config.use_triton and HAS_TRITON and hasattr(self, '_forward_triton_fused'):
+                 # Ensure _forward_triton_fused handles GQA/MQA correctly if self.num_kv_heads != self.num_attention_heads
+                return self._forward_triton_fused(hidden_states, attention_mask)
+
+            # Project and prepare QKV using the fused layer
+            q, k, v = self._prepare_qkv(hidden_states) # Returns q:[b,s,qh,d], k:[b,s,kvh,d], v:[b,s,kvh,d]
+
+            # TODO: Handle GQA/MQA repetition for standard FlashAttention if needed
+            # (See comment in FlashAttentionLayer)
+            # if self.num_kv_heads < self.num_attention_heads:
+            #     num_reps = self.num_attention_heads // self.num_kv_heads
+            #     k = k.repeat_interleave(num_reps, dim=2) # Repeat along head dim
+            #     v = v.repeat_interleave(num_reps, dim=2)
+
+            # Compute attention with flash attention algorithm
+            # Expects [batch_size, seqlen, nheads, d]
+            context_layer = self.flash_attention(q, k, v, attention_mask)
+
+            # Reshape back: [batch_size, q_seq_len, num_heads, head_dim] -> [batch_size, q_seq_len, hidden_size]
+            context_layer = context_layer.view(batch_size, q_seq_len, self.hidden_size)
+
+            # Apply output projection
+            output = self.o_proj(context_layer)
+
+            return output
+
     def _prepare_qkv(
-        self, 
+        self,
         hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Prepare query, key, and value tensors from hidden states.
-        
+        Prepare query, key, and value tensors from hidden states using fused projection.
+        Handles GQA/MQA splitting.
+
         Args:
             hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size]
-            
+
         Returns:
-            q, k, v: Query, key, and value tensors of shape 
-                    [batch_size, seq_len, num_heads, head_dim]
+            q: [batch_size, seq_len, num_attention_heads, head_dim]
+            k: [batch_size, seq_len, num_kv_heads, head_dim]
+            v: [batch_size, seq_len, num_kv_heads, head_dim]
         """
         batch_size, seq_len, _ = hidden_states.shape
-        
+
         # Apply fused QKV projection
         qkv = self.qkv_proj(hidden_states)
-        
-        # Reshape and split into q, k, v
-        qkv = qkv.view(batch_size, seq_len, 3, self.num_attention_heads, self.head_dim)
-        q, k, v = qkv.unbind(dim=2)
-        
+
+        # Split fused QKV
+        q_dim = self.hidden_size
+        kv_dim = self.num_kv_heads * self.head_dim
+        q, k, v = torch.split(qkv, [q_dim, kv_dim, kv_dim], dim=-1)
+
+        # Reshape
+        q = q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+
         return q, k, v
-    
-    def _merge_heads(self, x: torch.Tensor, num_heads: int) -> torch.Tensor:
-        """
-        Reshape tensor from [batch_size, seq_len, num_heads, head_dim] to
-        [batch_size, seq_len, hidden_size].
-        
-        Args:
-            x: Input tensor
-            num_heads: Number of attention heads
-            
-        Returns:
-            Reshaped tensor
-        """
-        batch_size, seq_len, _, head_dim = x.shape
-        hidden_size = num_heads * head_dim
-        
-        x = x.view(batch_size, seq_len, hidden_size)
-        return x
-        
+
     def _forward_triton_fused(
-        self, 
-        hidden_states: torch.Tensor, 
+        self,
+        hidden_states: torch.Tensor,
         attention_mask: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         """
         Compute flash attention using the fused Triton kernels for maximum efficiency.
-        
-        This implementation uses a single kernel to compute the entire attention
-        operation including QKV projection and output projection.
-        
-        Args:
-            hidden_states: Input tensor of shape [batch_size, seq_len, hidden_size]
-            attention_mask: Optional attention mask
-            
-        Returns:
-            output: Output tensor of shape [batch_size, seq_len, hidden_size]
+        NOTE: This might need adjustments for GQA/MQA if the underlying
+              `triton_fused_attention` kernel doesn't handle it.
         """
-        return triton_fused_attention(
+        # Placeholder - assumes triton_fused_attention handles GQA/MQA or num_kv_heads == num_attention_heads
+        # If not, QKV splitting/reshaping needs to happen before calling it.
+        if self.num_kv_heads != self.num_attention_heads:
+             logging.warning("_forward_triton_fused might not support GQA/MQA correctly yet.")
+
+        # This call likely assumes num_heads means Q heads and handles K/V internally based on weights
+        return triton_fused_attention( # Assuming this kernel exists and handles GQA
             hidden_states=hidden_states,
             qkv_weight=self.qkv_proj.weight,
             qkv_bias=self.qkv_proj.bias,
@@ -745,7 +883,8 @@ class FlashSelfAttention(nn.Module):
             out_bias=self.o_proj.bias,
             mask=attention_mask,
             causal=self.config.causal,
-            num_heads=self.num_attention_heads,
+            num_heads=self.num_attention_heads, # Pass Q heads
+            # num_kv_heads=self.num_kv_heads # Pass KV heads if kernel supports it
             head_dim=self.head_dim,
             dropout_p=self.config.dropout_p if self.training else 0.0,
             softmax_scale=self.config.softmax_scale,

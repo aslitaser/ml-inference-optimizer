@@ -625,6 +625,286 @@ if TRITON_AVAILABLE:
         )
 
 
+    @triton.jit
+    def _paged_attention_fwd_kernel(
+        # Input/Output Pointers
+        q_ptr, o_ptr,
+        # Physical KV Cache Pointers
+        k_cache_ptr, v_cache_ptr,
+        # Metadata Pointers
+        block_tables_ptr, context_lengths_ptr,
+        # Dimensions
+        batch_size, num_heads, q_seq_len, head_dim, max_seq_len,
+        num_layers, layer_idx,  # Added num_layers and layer_idx
+        # Strides (Query, Output)
+        stride_qb, stride_qh, stride_qs, stride_qd,
+        stride_ob, stride_oh, stride_os, stride_od,
+        # Strides (Physical K/V Cache) - Assuming layout [num_blocks, num_layers, block_size, num_heads, head_dim]
+        stride_kcb, stride_kcl, stride_kcs, stride_kch, stride_kcd,
+        stride_vcb, stride_vcl, stride_vcs, stride_vch, stride_vcd,
+        # Strides (Metadata) - Assuming layout [batch_size, max_num_blocks]
+        stride_btb, stride_bts,
+        stride_cl, # Stride for context_lengths [batch_size]
+        # Attention Parameters
+        scale_factor: tl.constexpr,
+        # Block Size for Kernel Launch
+        BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr,
+        BLOCK_SIZE_D: tl.constexpr,
+        # Physical Block Size (tokens per block)
+        BLOCK_SIZE_P: tl.constexpr,
+        # Number of warps/stages
+        num_warps: tl.constexpr, num_stages: tl.constexpr
+    ):
+        """
+        Triton Kernel for Paged Attention Forward Pass.
+
+        Computes attention where Key and Value tensors are stored in paged (non-contiguous)
+        physical memory blocks accessed via block tables.
+
+        Args:
+            q_ptr: Query tensor pointer [batch_size, num_heads, q_seq_len, head_dim]
+            o_ptr: Output tensor pointer [batch_size, num_heads, q_seq_len, head_dim]
+            k_cache_ptr: Physical K cache pointer [num_blocks, num_layers, block_size, num_heads, head_dim]
+            v_cache_ptr: Physical V cache pointer [num_blocks, num_layers, block_size, num_heads, head_dim]
+            block_tables_ptr: Block tables pointer [batch_size, max_num_blocks_per_seq] (int32/int64)
+            context_lengths_ptr: Context lengths pointer [batch_size] (int32/int64)
+            batch_size, num_heads, q_seq_len, head_dim: Dimensions
+            max_seq_len: Maximum sequence length the cache supports (used for masking/padding)
+            num_layers: Total number of layers in the physical cache.
+            layer_idx: The current layer index being processed.
+            (various strides): Memory layout strides for tensors.
+            scale_factor: Scale factor for attention scores (1 / sqrt(head_dim)).
+            BLOCK_SIZE_M: Tile size for query sequence length dimension.
+            BLOCK_SIZE_N: Tile size for key/value sequence length dimension.
+            BLOCK_SIZE_D: Tile size for head dimension.
+            BLOCK_SIZE_P: Physical block size (number of tokens per block).
+            num_warps: Number of warps for parallelism.
+            num_stages: Number of pipeline stages for software pipelining.
+        """
+        # --- Grid and Block IDs ---
+        # Program ID along sequence dimension
+        pid_m = tl.program_id(0)
+        # Program ID along batch/head dimension
+        pid_bh = tl.program_id(1)
+
+        # Calculate batch and head indices
+        batch_id = pid_bh // num_heads
+        head_id = pid_bh % num_heads
+
+        # --- Pointers Setup ---
+        # Query pointer for this batch, head, and block
+        offs_m = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M) # Query token indices in this block
+        offs_d = tl.arange(0, BLOCK_SIZE_D) # Head dimension indices
+        q_offs = batch_id * stride_qb + head_id * stride_qh + offs_m[:, None] * stride_qs + offs_d[None, :] * stride_qd
+        q_ptrs = q_ptr + q_offs
+
+        # Output pointer for this batch, head, and block
+        o_offs = batch_id * stride_ob + head_id * stride_oh + offs_m[:, None] * stride_os + offs_d[None, :] * stride_od
+        o_ptrs = o_ptr + o_offs
+
+        # Context length for this batch element
+        context_len = tl.load(context_lengths_ptr + batch_id * stride_cl)
+
+        # --- Accumulators Initialization ---
+        acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_D), dtype=tl.float32)
+        m_i = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32) - float("inf")
+        l_i = tl.zeros((BLOCK_SIZE_M,), dtype=tl.float32)
+
+        # Load query block
+        # Only load queries within the actual query sequence length (typically 1 for decode)
+        q_mask = (offs_m[:, None] < q_seq_len) & (offs_d[None, :] < head_dim)
+        q = tl.load(q_ptrs, mask=q_mask, other=0.0)
+        q = (q * scale_factor).to(tl.float16) # Scale query
+
+        # --- Main Loop over Key/Value Sequence Length (Context) ---
+        # Iterate through the context sequence length in blocks of BLOCK_SIZE_N
+        for start_n in range(0, context_len, BLOCK_SIZE_N):
+            offs_n = start_n + tl.arange(0, BLOCK_SIZE_N) # Key/Value token indices in this block
+
+            # --- Physical Block Lookup and K/V Pointer Calculation ---
+            # Calculate logical block indices and offsets for this block of K/V positions
+            logical_block_indices = offs_n // BLOCK_SIZE_P
+            block_offsets = offs_n % BLOCK_SIZE_P
+
+            # Load physical block indices from the block table for this batch element
+            # Pointers to the relevant part of the block table for these logical indices
+            bt_ptrs = block_tables_ptr + batch_id * stride_btb + logical_block_indices * stride_bts
+            # Mask loading based on valid logical block indices (within the sequence's allocated blocks)
+            # Note: Assuming block table stores indices sequentially
+            max_logical_block = (context_len + BLOCK_SIZE_P - 1) // BLOCK_SIZE_P
+            bt_mask = logical_block_indices < max_logical_block
+            physical_block_indices = tl.load(bt_ptrs, mask=bt_mask, other=-1) # Load physical indices, -1 if invalid
+
+            # Calculate pointers for K cache
+            # Base + physical_block_idx * block_stride + layer_stride + block_offset * token_stride + head_stride + dim_stride
+            k_block_offs = (physical_block_indices[:, None] * stride_kcb +       # Block stride
+                             layer_idx * stride_kcl +                          # Layer stride
+                             block_offsets[:, None] * stride_kcs +               # Token stride within block
+                             head_id * stride_kch +                             # Head stride
+                             offs_d[None, :] * stride_kcd)                      # Dim stride
+            k_ptrs = k_cache_ptr + k_block_offs
+
+            # Calculate pointers for V cache (similar structure)
+            v_block_offs = (physical_block_indices[:, None] * stride_vcb +
+                             layer_idx * stride_vcl +
+                             block_offsets[:, None] * stride_vcs +
+                             head_id * stride_vch +
+                             offs_d[None, :] * stride_vcd)
+            v_ptrs = v_cache_ptr + v_block_offs
+
+            # --- Load K and V Blocks ---
+            # Mask loading based on actual context length and valid physical blocks
+            kv_mask_n = (offs_n[:, None] < context_len) & (physical_block_indices[:, None] != -1) # Valid token positions and allocated block
+            kv_mask_d = (offs_d[None, :] < head_dim)
+            kv_mask = kv_mask_n & kv_mask_d
+
+            k = tl.load(k_ptrs, mask=kv_mask, other=0.0) # [BLOCK_SIZE_N, BLOCK_SIZE_D]
+            v = tl.load(v_ptrs, mask=kv_mask, other=0.0) # [BLOCK_SIZE_N, BLOCK_SIZE_D]
+
+            # --- Attention Calculation ---
+            # Compute QK^T scores
+            # q: [BLOCK_SIZE_M, BLOCK_SIZE_D], k: [BLOCK_SIZE_N, BLOCK_SIZE_D] -> scores: [BLOCK_SIZE_M, BLOCK_SIZE_N]
+            scores = tl.dot(q, tl.trans(k), allow_tf32=False) # Use FP32 for scores
+
+            # Mask scores for padding (tokens beyond context length)
+            # offs_m = current query block indices, offs_n = current key block indices
+            score_mask = (offs_m[:, None] < q_seq_len) & (offs_n[None, :] < context_len)
+            # Apply causal mask if needed (assuming standard causal mask here)
+            # Causal mask: query pos < key pos is masked
+            causal_mask = offs_m[:, None] >= offs_n[None, :]
+            # Combine masks
+            # score_mask = score_mask & causal_mask # Uncomment if causal mask needed inside kernel
+            scores = tl.where(score_mask, scores, -float("inf"))
+
+            # --- Online Softmax ---
+            m_ij = tl.max(scores, axis=1) # Max score per query row in this block
+            p_ij = tl.exp(scores - m_ij[:, None]) # Unnormalized probabilities
+            l_ij = tl.sum(p_ij, axis=1) # Sum of probabilities per query row
+
+            # Update statistics
+            m_i_new = tl.maximum(m_i, m_ij)
+            alpha = tl.exp(m_i - m_i_new)
+            beta = tl.exp(m_ij - m_i_new)
+
+            # Update accumulators
+            acc_scaled = acc * alpha[:, None]
+            l_i = l_i * alpha + beta * l_ij
+
+            # Update output accumulator (Attention(Q,K,V) = softmax(QK^T/sqrt(dk))V)
+            # p_ij: [BLOCK_SIZE_M, BLOCK_SIZE_N], v: [BLOCK_SIZE_N, BLOCK_SIZE_D] -> pv: [BLOCK_SIZE_M, BLOCK_SIZE_D]
+            pv = tl.dot(p_ij.to(tl.float16), v, allow_tf32=False)
+            acc = acc_scaled + pv * beta[:, None]
+
+            # Update max scores accumulator
+            m_i = m_i_new
+
+        # --- Final Normalization and Output ---
+        # Normalize accumulated output values
+        l_i = tl.where(l_i == 0, 1.0, l_i) # Avoid division by zero
+        acc = acc / l_i[:, None]
+
+        # Write output block
+        out_mask = (offs_m[:, None] < q_seq_len) & (offs_d[None, :] < head_dim)
+        tl.store(o_ptrs, acc.to(o_ptr.dtype.element_ty), mask=out_mask)
+
+
+    @triton.jit
+    def _reshape_and_cache_kernel(
+        # Input K/V Projections (for current token(s))
+        k_ptr, v_ptr,
+        # Physical KV Cache Pointers
+        k_cache_ptr, v_cache_ptr,
+        # Metadata Pointers
+        block_tables_ptr, context_lengths_ptr,
+        # Dimensions
+        batch_size, num_kv_heads, q_seq_len, head_dim,
+        num_layers, layer_idx,
+        # Strides (Input K/V) - Assuming [batch_size, q_seq_len, num_kv_heads, head_dim]
+        stride_kb, stride_ks, stride_kh, stride_kd, # Input K strides
+        stride_vb, stride_vs, stride_vh, stride_vd, # Input V strides
+        # Strides (Physical K/V Cache) - Assuming [num_blocks, num_layers, block_size, num_kv_heads, head_dim]
+        stride_kcb, stride_kcl, stride_kcs, stride_kch, stride_kcd,
+        stride_vcb, stride_vcl, stride_vcs, stride_vch, stride_vcd,
+        # Strides (Metadata) - Assuming [batch_size, max_num_blocks]
+        stride_btb, stride_bts,
+        stride_cl, # Stride for context_lengths [batch_size]
+        # Physical Block Size (tokens per block)
+        BLOCK_SIZE_P: tl.constexpr,
+        # Tile size for head dimension
+        BLOCK_SIZE_D: tl.constexpr,
+    ):
+        """
+        Triton kernel to reshape K/V projections for the current token(s) and write them
+        into the physical paged KV cache.
+
+        Typically used during decoding where q_seq_len = 1.
+
+        Args:
+            k_ptr, v_ptr: Pointers to K/V projection tensors for the current token(s).
+                          Shape typically [batch_size, 1, num_kv_heads, head_dim]
+            k_cache_ptr, v_cache_ptr: Pointers to the physical K/V cache tensors.
+            block_tables_ptr: Pointer to the block tables.
+            context_lengths_ptr: Pointer to the context lengths (used to find the write position).
+            (Dimensions and Strides): Tensor dimensions and strides.
+            BLOCK_SIZE_P: Physical block size (tokens per block).
+            BLOCK_SIZE_D: Tile size for processing head dimension.
+        """
+        # --- Grid and Block IDs ---
+        # Program ID along batch dimension
+        pid_b = tl.program_id(0)
+        # Program ID along head dimension (split by BLOCK_SIZE_D)
+        pid_hd = tl.program_id(1)
+
+        offs_d = pid_hd * BLOCK_SIZE_D + tl.arange(0, BLOCK_SIZE_D)
+        head_dim_mask = offs_d < head_dim
+
+        # --- Calculate Write Position in Cache --- 
+        # Context length determines the token position to write to.
+        # For decode (q_seq_len=1), context_length includes the *new* token position.
+        context_len = tl.load(context_lengths_ptr + pid_b * stride_cl)
+        # Position of the token we are writing (0-indexed)
+        write_pos = context_len - 1 
+
+        # Calculate the logical block index and offset within the block for this position
+        logical_block_idx = write_pos // BLOCK_SIZE_P
+        offset_in_block = write_pos % BLOCK_SIZE_P
+
+        # Load the physical block index from the block table
+        # Note: Assumes block table already contains the allocated block for `write_pos`
+        bt_ptr = block_tables_ptr + pid_b * stride_btb + logical_block_idx * stride_bts
+        physical_block_idx = tl.load(bt_ptr) # Assuming table contains valid indices
+
+        # --- Load K/V for the current token --- 
+        # Iterate through heads assigned to this block
+        for h in range(num_kv_heads):
+            k_val_ptrs = k_ptr + pid_b * stride_kb + 0 * stride_ks + h * stride_kh + offs_d * stride_kd
+            v_val_ptrs = v_ptr + pid_b * stride_vb + 0 * stride_vs + h * stride_vh + offs_d * stride_vd
+
+            k_vals = tl.load(k_val_ptrs, mask=head_dim_mask, other=0.0)
+            v_vals = tl.load(v_val_ptrs, mask=head_dim_mask, other=0.0)
+
+            # --- Calculate Cache Write Pointers --- 
+            # Pointer calculation for K cache
+            k_cache_offs = (physical_block_idx * stride_kcb +    # Block stride
+                            layer_idx * stride_kcl +           # Layer stride
+                            offset_in_block * stride_kcs +     # Offset within block
+                            h * stride_kch +                  # Head stride
+                            offs_d * stride_kcd)              # Dim stride
+            k_cache_write_ptrs = k_cache_ptr + k_cache_offs
+
+            # Pointer calculation for V cache
+            v_cache_offs = (physical_block_idx * stride_vcb +
+                            layer_idx * stride_vcl +
+                            offset_in_block * stride_vcs +
+                            h * stride_vch +
+                            offs_d * stride_vcd)
+            v_cache_write_ptrs = v_cache_ptr + v_cache_offs
+
+            # --- Write to Cache ---
+            tl.store(k_cache_write_ptrs, k_vals, mask=head_dim_mask)
+            tl.store(v_cache_write_ptrs, v_vals, mask=head_dim_mask)
+
+
     # Python wrapper functions for the Triton kernels
     def triton_ring_attention_forward(
         query: torch.Tensor,
@@ -921,6 +1201,210 @@ if TRITON_AVAILABLE:
         output = output.view(batch_size, seq_len, num_heads * head_dim)
         
         return output
+
+
+    def triton_paged_attention_forward(
+        query: torch.Tensor,                   # [batch_size, num_heads, q_seq_len, head_dim]
+        output: torch.Tensor,                  # [batch_size, num_heads, q_seq_len, head_dim] (pre-allocated)
+        k_cache: torch.Tensor,                 # [num_blocks, num_layers, block_size, num_heads, head_dim]
+        v_cache: torch.Tensor,                 # [num_blocks, num_layers, block_size, num_heads, head_dim]
+        block_tables: torch.Tensor,            # [batch_size, max_num_blocks_per_seq] (int32)
+        context_lengths: torch.Tensor,         # [batch_size] (int32)
+        block_size: int,                       # Physical block size (e.g., 16)
+        max_seq_len: int,                      # Max sequence length capacity
+        layer_idx: int                         # Current layer index
+    ) -> torch.Tensor:
+        """
+        Python wrapper for the Paged Attention forward kernel.
+
+        Args:
+            query: Query tensor.
+            output: Pre-allocated output tensor.
+            k_cache: Physical K cache tensor.
+            v_cache: Physical V cache tensor.
+            block_tables: Tensor mapping logical block indices to physical block indices for each sequence.
+            context_lengths: Tensor containing the current length of each sequence in the batch.
+            block_size: The number of tokens per physical block.
+            max_seq_len: Maximum sequence length the cache can hold (for bounds checking).
+            layer_idx: The layer index for which to compute attention.
+
+        Returns:
+            The output tensor containing the attention results.
+        """
+        assert TRITON_AVAILABLE, "Triton is required for paged attention kernel."
+        assert query.ndim == 4, "Query must be 4D (batch, heads, seq, dim)"
+        assert k_cache.ndim == 5, "K cache must be 5D (blocks, layers, block_size, heads, dim)"
+        assert v_cache.ndim == 5, "V cache must be 5D (blocks, layers, block_size, heads, dim)"
+        assert block_tables.ndim == 2, "Block tables must be 2D (batch, max_blocks)"
+        assert context_lengths.ndim == 1, "Context lengths must be 1D (batch)"
+        assert query.device == k_cache.device == v_cache.device == block_tables.device == context_lengths.device, "All tensors must be on the same device"
+        assert query.device.type == 'cuda', "Tensors must be on CUDA device"
+        assert block_tables.dtype == torch.int32, "Block tables must be int32"
+        assert context_lengths.dtype == torch.int32, "Context lengths must be int32"
+
+        # Tensor shapes
+        batch_size, num_heads, q_seq_len, head_dim = query.shape
+        num_blocks, num_layers, _, _, _ = k_cache.shape
+
+        # Kernel block sizes (tuning parameters)
+        # These need careful tuning based on GPU architecture and head_dim
+        BLOCK_SIZE_M = 16 if q_seq_len == 1 else 64 # Smaller for decode, larger for prefill
+        BLOCK_SIZE_N = 64
+        BLOCK_SIZE_D = head_dim # Process full head dim per thread block
+
+        # Scale factor
+        scale_factor = (head_dim ** -0.5)
+
+        # Output tensor (use pre-allocated)
+        # output = torch.empty_like(query) # No need if output is passed in
+
+        # Grid dimensions
+        grid = (triton.cdiv(q_seq_len, BLOCK_SIZE_M), batch_size * num_heads)
+
+        # Physical cache strides (layout: [num_blocks, num_layers, block_size, num_heads, head_dim])
+        stride_kcb = k_cache.stride(0)
+        stride_kcl = k_cache.stride(1)
+        stride_kcs = k_cache.stride(2)
+        stride_kch = k_cache.stride(3)
+        stride_kcd = k_cache.stride(4)
+        stride_vcb = v_cache.stride(0)
+        stride_vcl = v_cache.stride(1)
+        stride_vcs = v_cache.stride(2)
+        stride_vch = v_cache.stride(3)
+        stride_vcd = v_cache.stride(4)
+
+        # Block table strides (layout: [batch_size, max_num_blocks_per_seq])
+        stride_btb = block_tables.stride(0)
+        stride_bts = block_tables.stride(1)
+
+        # Context lengths stride (layout: [batch_size])
+        stride_cl = context_lengths.stride(0)
+
+        # Kernel launch
+        _paged_attention_fwd_kernel[grid](
+            # Pointers
+            query, output,
+            k_cache, v_cache,
+            block_tables, context_lengths,
+            # Dimensions
+            batch_size, num_heads, q_seq_len, head_dim, max_seq_len,
+            num_layers, layer_idx,
+            # Strides (Query, Output)
+            query.stride(0), query.stride(1), query.stride(2), query.stride(3),
+            output.stride(0), output.stride(1), output.stride(2), output.stride(3),
+            # Strides (K/V Cache)
+            stride_kcb, stride_kcl, stride_kcs, stride_kch, stride_kcd,
+            stride_vcb, stride_vcl, stride_vcs, stride_vch, stride_vcd,
+            # Strides (Metadata)
+            stride_btb, stride_bts,
+            stride_cl,
+            # Attention Parameters
+            scale_factor=scale_factor,
+            # Block Sizes
+            BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N, BLOCK_SIZE_D=BLOCK_SIZE_D,
+            BLOCK_SIZE_P=block_size, # Physical block size
+            # Performance Tuning
+            num_warps=4, # Example, needs tuning
+            num_stages=2  # Example, needs tuning
+        )
+
+        return output
+
+
+    def triton_reshape_and_cache(
+        key: torch.Tensor,                     # [batch_size, q_seq_len, num_kv_heads, head_dim] (Current key)
+        value: torch.Tensor,                   # [batch_size, q_seq_len, num_kv_heads, head_dim] (Current value)
+        k_cache: torch.Tensor,                 # [num_blocks, num_layers, block_size, num_kv_heads, head_dim] (Physical K cache)
+        v_cache: torch.Tensor,                 # [num_blocks, num_layers, block_size, num_kv_heads, head_dim] (Physical V cache)
+        block_tables: torch.Tensor,            # [batch_size, max_num_blocks_per_seq] (int32)
+        context_lengths: torch.Tensor,         # [batch_size] (int32) - Length *including* current token
+        layer_idx: int                         # Current layer index
+    ):
+        """
+        Python wrapper for the reshape_and_cache kernel.
+        Writes the key and value for the current token(s) into the physical KV cache.
+
+        Args:
+            key: Key tensor for the current token(s).
+            value: Value tensor for the current token(s).
+            k_cache: Physical K cache tensor.
+            v_cache: Physical V cache tensor.
+            block_tables: Tensor mapping logical block indices to physical block indices.
+            context_lengths: Tensor containing the current length of each sequence (including new token).
+            layer_idx: The layer index being processed.
+        """
+        assert TRITON_AVAILABLE, "Triton is required for reshape_and_cache kernel."
+        assert key.ndim == 4 and value.ndim == 4, "Key/Value must be 4D (batch, seq, heads, dim)"
+        assert k_cache.ndim == 5, "K cache must be 5D (blocks, layers, block_size, heads, dim)"
+        assert v_cache.ndim == 5, "V cache must be 5D (blocks, layers, block_size, heads, dim)"
+        assert block_tables.ndim == 2, "Block tables must be 2D (batch, max_blocks)"
+        assert context_lengths.ndim == 1, "Context lengths must be 1D (batch)"
+        assert key.device == value.device == k_cache.device == v_cache.device == block_tables.device == context_lengths.device, "All tensors must be on the same device"
+        assert key.device.type == 'cuda', "Tensors must be on CUDA device"
+        assert block_tables.dtype == torch.int32, "Block tables must be int32"
+        assert context_lengths.dtype == torch.int32, "Context lengths must be int32"
+
+        # Tensor shapes
+        batch_size, q_seq_len, num_kv_heads, head_dim = key.shape
+        num_blocks, num_layers, block_size_p, _, _ = k_cache.shape
+
+        # Kernel block size for head dimension (tuning parameter)
+        BLOCK_SIZE_D = 64 # Process head_dim in chunks of 64
+        if head_dim > 128:
+             BLOCK_SIZE_D = 128
+        elif head_dim <= 32:
+             BLOCK_SIZE_D = 32
+        else:
+             BLOCK_SIZE_D = head_dim # Process full head dim if <= 64
+
+        # Grid dimensions
+        grid = (batch_size, triton.cdiv(head_dim, BLOCK_SIZE_D) * num_kv_heads) # Parallelize over batch and heads/dims
+        # Note: If q_seq_len > 1 (prefill with caching), grid/kernel needs adjustment
+        if q_seq_len > 1:
+            logging.warning("reshape_and_cache kernel currently assumes q_seq_len=1 (decode). Prefill caching needs adjustment.")
+            # For prefill, would need to iterate over q_seq_len inside kernel or launch more blocks
+
+        # Physical cache strides (layout: [num_blocks, num_layers, block_size, num_kv_heads, head_dim])
+        stride_kcb, stride_kcl, stride_kcs, stride_kch, stride_kcd = k_cache.stride()
+        stride_vcb, stride_vcl, stride_vcs, stride_vch, stride_vcd = v_cache.stride()
+
+        # Block table strides (layout: [batch_size, max_num_blocks_per_seq])
+        stride_btb, stride_bts = block_tables.stride()
+
+        # Context lengths stride (layout: [batch_size])
+        stride_cl = context_lengths.stride(0)
+
+        # Input K/V strides (layout: [batch_size, q_seq_len, num_kv_heads, head_dim])
+        stride_kb, stride_ks, stride_kh, stride_kd = key.stride()
+        stride_vb, stride_vs, stride_vh, stride_vd = value.stride()
+
+        # Kernel launch
+        _reshape_and_cache_kernel[grid](
+            # Input K/V Projections
+            key, value,
+            # Physical KV Cache Pointers
+            k_cache, v_cache,
+            # Metadata Pointers
+            block_tables, context_lengths,
+            # Dimensions
+            batch_size, num_kv_heads, q_seq_len, head_dim,
+            num_layers, layer_idx,
+            # Strides (Input K/V)
+            stride_kb, stride_ks, stride_kh, stride_kd,
+            stride_vb, stride_vs, stride_vh, stride_vd,
+            # Strides (Physical K/V Cache)
+            stride_kcb, stride_kcl, stride_kcs, stride_kch, stride_kcd,
+            stride_vcb, stride_vcl, stride_vcs, stride_vch, stride_vcd,
+            # Strides (Metadata)
+            stride_btb, stride_bts,
+            stride_cl,
+            # Constexpr Params
+            BLOCK_SIZE_P=block_size_p,
+            BLOCK_SIZE_D=BLOCK_SIZE_D,
+            # Performance Tuning
+            num_warps=4, # Example, needs tuning
+            # num_stages= # Not typically needed for simple store kernel
+        )
 
 
     # Utility functions for benchmarking and comparing
