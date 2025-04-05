@@ -6,7 +6,7 @@ featuring improved memory efficiency and speed compared to standard attention me
 It implements the core ideas from the FlashAttention3 paper with additional optimizations.
 
 Key features:
-- O(sqrt(N)) memory complexity instead of O(N²) 
+- O(sqrt(N)) memory complexity instead of O(Nï¿½) 
 - Optimized block-sparse attention for long sequences
 - Multiple precision options (fp16, bf16, fp32)
 - Causal masking support
@@ -20,7 +20,7 @@ References:
 
 import math
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple, Union, Set
 
 import torch
 import torch.nn as nn
@@ -50,6 +50,7 @@ class FlashAttentionConfig:
         memory_efficient: Whether to use memory-efficient implementation
         precision: Precision mode ("fp16", "bf16", "fp32")
         normalize_query: Whether to normalize query vectors (like in GQA)
+        fp8_ortho_matrix: Precomputed orthogonal matrix for FP8 incoherent processing
     """
     block_size: int = 128  # Block size for tiling
     causal: bool = False  # Whether to use causal masking
@@ -60,6 +61,33 @@ class FlashAttentionConfig:
     memory_efficient: bool = True  # Whether to use memory-efficient implementation
     precision: str = "fp16"  # Precision for computation ("fp16", "bf16", "fp32")
     normalize_query: bool = False  # Whether to apply GQA-style normalization to query
+    fp8_ortho_matrix: Optional[torch.Tensor] = None # Precomputed orthogonal matrix for FP8 incoherent processing
+    # TODO: Add seed for on-the-fly generation if matrix is not precomputed
+
+    @property
+    def allowed_precisions(self) -> Set[str]:
+        return {"fp16", "bf16", "fp32", "fp8"}
+
+    def __post_init__(self):
+        if self.precision not in self.allowed_precisions:
+            raise ValueError(f"Unsupported precision mode: {self.precision}. Allowed: {self.allowed_precisions}")
+        
+        if self.precision == "fp8":
+            if not HAS_TRITON:
+                raise RuntimeError("FP8 precision requires Triton to be installed.")
+            if not torch.cuda.is_available():
+                 raise RuntimeError("FP8 precision requires a CUDA-enabled GPU.")
+            # Check for Hopper+ architecture (Compute Capability 9.0+)
+            major, minor = torch.cuda.get_device_capability()
+            if major < 9:
+                 raise RuntimeError(f"FP8 precision requires Hopper architecture (Compute Capability 9.0+) but found {major}.{minor}.")
+            if not self.use_triton:
+                 print("Warning: FP8 precision requested, but use_triton=False. Enabling Triton as it's required for FP8.")
+                 self.use_triton = True
+            # Decide if the orthogonal matrix needs generation or is provided
+            # For now, we assume it might be passed or handled later
+            # if self.fp8_ortho_matrix is None:
+            #    print("Warning: FP8 enabled but no orthogonal matrix provided. Incoherent processing might not be applied unless handled by the kernel.")
 
 
 class FlashAttention3(nn.Module):
@@ -68,7 +96,7 @@ class FlashAttention3(nn.Module):
     
     This implementation significantly reduces memory usage by avoiding materializing
     the full attention matrix. It uses a tiled block-based approach to compute attention
-    incrementally, resulting in O(sqrt(N)) memory complexity instead of O(N²).
+    incrementally, resulting in O(sqrt(N)) memory complexity instead of O(Nï¿½).
     
     Key optimizations:
     1. Block-based tiling for memory efficiency
@@ -87,14 +115,16 @@ class FlashAttention3(nn.Module):
         super().__init__()
         self.config = config or FlashAttentionConfig()
         
-        # Validate configuration
+        # Validate configuration - moved most checks to __post_init__ of the config
         if self.config.use_triton and not HAS_TRITON:
+            # Keep this check for general Triton availability fallback
             print("Warning: Triton not available. Falling back to PyTorch implementation.")
             self.config.use_triton = False
-            
-        if self.config.precision not in ["fp16", "bf16", "fp32"]:
-            raise ValueError(f"Unsupported precision mode: {self.config.precision}")
-        
+        # FP8 specific checks are now in FlashAttentionConfig.__post_init__
+        # Remove the old precision check here as it's redundant
+        # if self.config.precision not in ["fp16", "bf16", "fp32"]:
+        #    raise ValueError(f"Unsupported precision mode: {self.config.precision}")
+
         # For backward compatibility with older PyTorch versions
         self.supports_backward = True  
         
@@ -124,24 +154,55 @@ class FlashAttention3(nn.Module):
             raise ValueError(f"Expected 4D tensors for q, k, v but got shapes: "
                              f"q={q.shape}, k={k.shape}, v={v.shape}")
             
+        # Ensure inputs are on the correct device (CUDA is required for FP8/Triton)
+        if self.config.use_triton and not q.is_cuda:
+             raise ValueError("Triton kernels require input tensors to be on a CUDA device.")
+
         # Cast to appropriate precision if needed
         orig_dtype = q.dtype
-        if self.config.precision == "fp16" and q.dtype != torch.float16:
-            q, k, v = q.half(), k.half(), v.half()
-        elif self.config.precision == "bf16" and q.dtype != torch.bfloat16:
-            q, k, v = q.bfloat16(), k.bfloat16(), v.bfloat16()
-        elif self.config.precision == "fp32" and q.dtype != torch.float32:
-            q, k, v = q.float(), k.float(), v.float()
+        target_dtype = None
+        if self.config.precision == "fp16":
+            target_dtype = torch.float16
+        elif self.config.precision == "bf16":
+            target_dtype = torch.bfloat16
+        elif self.config.precision == "fp32":
+            target_dtype = torch.float32
+        elif self.config.precision == "fp8":
+            # Use torch.float8_e4m3fn for FP8 E4M3 format
+            # Requires PyTorch 2.1+
+            if hasattr(torch, "float8_e4m3fn"):
+                 target_dtype = torch.float8_e4m3fn
+            else:
+                 raise RuntimeError("FP8 precision requires PyTorch 2.1 or later with float8 support.")
         
+        if target_dtype and q.dtype != target_dtype:
+             q = q.to(target_dtype)
+             k = k.to(target_dtype)
+             v = v.to(target_dtype)
+             if mask is not None and mask.dtype != torch.bool:
+                 # Ensure mask is boolean for efficiency if casting other inputs
+                 mask = mask.bool()
+
         # Apply query normalization if requested
         if self.config.normalize_query:
             q = F.normalize(q, dim=-1)
             
         # Dispatch to appropriate implementation
-        if self.config.use_triton and HAS_TRITON:
-            output = self._forward_triton(q, k, v, mask)
+        if self.config.use_triton:
+             # Perform FP8 checks again here, as config might be modified after init
+             if self.config.precision == "fp8":
+                 if not q.is_cuda: raise RuntimeError("FP8 requires CUDA tensors.")
+                 major, minor = torch.cuda.get_device_capability(q.device)
+                 if major < 9: raise RuntimeError(f"FP8 requires CC 9.0+ (Hopper), found {major}.{minor}.")
+                 if not HAS_TRITON: raise RuntimeError("FP8 requires Triton.") # Should be caught earlier but double check
+                 # TODO: Potentially generate or ensure orthogonal matrix exists here if not passed in config
+                 
+             output = self._forward_triton(q, k, v, mask)
         else:
-            output = self._forward_pytorch(q, k, v, mask)
+             if self.config.precision == "fp8":
+                 # Explicitly disallow FP8 with PyTorch fallback
+                 raise RuntimeError("FP8 precision is only supported with the Triton backend.")
+             output = self._forward_pytorch(q, k, v, mask)
             
         # Cast back to original dtype if needed
         if isinstance(output, tuple):
@@ -160,7 +221,7 @@ class FlashAttention3(nn.Module):
         Compute flash attention using Triton kernels.
         
         Args:
-            q, k, v: Query, key, value tensors
+            q, k, v: Query, key, value tensors (potentially FP8)
             mask: Optional attention mask
             
         Returns:
@@ -171,6 +232,19 @@ class FlashAttention3(nn.Module):
         head_dim = q.shape[-1]
         softmax_scale = self.config.softmax_scale or (1.0 / math.sqrt(head_dim))
         
+        # Prepare orthogonal matrix if FP8 is enabled and matrix is needed
+        ortho_matrix = None
+        if self.config.precision == "fp8":
+            # Use precomputed matrix if available
+            if self.config.fp8_ortho_matrix is not None:
+                 ortho_matrix = self.config.fp8_ortho_matrix.to(q.device, dtype=torch.float32) # Use FP32 for matrix mult stability
+            # TODO: Add logic to generate the matrix if not provided, maybe based on a seed?
+            # For now, we pass None if not precomputed. The kernel needs to handle this.
+            # Example generation (needs careful seeding/device handling):
+            # if ortho_matrix is None:
+            #    ortho_matrix = torch.randn(head_dim, head_dim, device=q.device, dtype=torch.float32)
+            #    ortho_matrix, _ = torch.linalg.qr(ortho_matrix)
+
         # Call triton kernel
         return triton_flash_attention(
             q=q, 
@@ -179,9 +253,11 @@ class FlashAttention3(nn.Module):
             mask=mask,
             causal=self.config.causal,
             softmax_scale=softmax_scale,
-            dropout_p=self.config.dropout_p,
+            dropout_p=self.config.dropout_p if self.training else 0.0, # Pass dropout only during training
             return_softmax=self.config.return_softmax,
             block_size=self.config.block_size,
+            precision=self.config.precision, # Pass precision info
+            ortho_matrix=ortho_matrix # Pass the orthogonal matrix for incoherent processing
         )
     
     def _forward_pytorch(

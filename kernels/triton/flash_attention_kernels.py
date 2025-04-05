@@ -68,7 +68,16 @@ if HAS_TRITON:
         # Meta-parameters
         BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
         BLOCK_N: tl.constexpr, CAUSAL: tl.constexpr,
-        USE_MASK: tl.constexpr
+        USE_MASK: tl.constexpr,
+        # FP8 related meta-parameters
+        IS_FP8: tl.constexpr,
+        USE_ORTHO_MAT: tl.constexpr,
+        STORE_L_M: tl.constexpr, # Flag to control storing L/m
+        ortho_matrix_ptr, # Optional pointer to orthogonal matrix for FP8
+        # Pointers for L and M statistics (optional, only needed if STORE_L_M)
+        l_ptr, m_ptr, 
+        stride_lb, stride_lh, stride_lm, # L strides
+        stride_mb, stride_mh, stride_mm, # m strides
     ):
         """
         Compute flash attention for a block of the output (Flash Attention 3).
@@ -98,6 +107,13 @@ if HAS_TRITON:
             BLOCK_N: Block size for processing keys and values
             CAUSAL: Whether to apply causal masking
             USE_MASK: Whether to apply an attention mask
+            IS_FP8: Whether FP8 precision is used
+            USE_ORTHO_MAT: Whether to apply orthogonal matrix transformation for FP8
+            ortho_matrix_ptr: Pointer to the orthogonal matrix (FP32) if USE_ORTHO_MAT is True
+            STORE_L_M: Whether to store L and m statistics for backward pass
+            l_ptr, m_ptr: Pointers to L and M tensors [batch_size, num_heads, seq_len]
+            stride_lb, stride_lh, stride_lm: Strides for L tensor
+            stride_mb, stride_mh, stride_mm: Strides for M tensor
         """
         # Compute which part of the output this program should compute
         pid_batch = tl.program_id(0)  # Batch index
@@ -120,6 +136,10 @@ if HAS_TRITON:
         q_block_ptr = q_ptr + q_offset
         # Compute range of valid queries for this block
         q_valid_range = min(BLOCK_M, seq_len - pid_m * BLOCK_M)
+        # Determine data type for loading (FP8 or standard)
+        # TODO: Ensure tl.float8e4m3nv is the correct type if using E4M3
+        tl_dtype = tl.float8e4m3fn if IS_FP8 else q_ptr.dtype.element_ty 
+        
         # Create mask for valid queries and dimensions
         q_mask = (tl.arange(0, BLOCK_M)[:, None] < q_valid_range) & (tl.arange(0, BLOCK_DMODEL)[None, :] < head_dim)
         # Load query block with masking
@@ -127,8 +147,27 @@ if HAS_TRITON:
             q_block_ptr + (tl.arange(0, BLOCK_M)[:, None] * stride_qm +
                            tl.arange(0, BLOCK_DMODEL)[None, :] * stride_qd),
             mask=q_mask,
-            other=0.0
-        )
+            other=0.0,
+            eviction_policy="evict_first" # Hint for Triton scheduler
+        ).to(tl.float32) # Always cast to float32 for internal computation
+        
+        # Apply orthogonal transformation if FP8 and enabled
+        if IS_FP8 and USE_ORTHO_MAT:
+            # Load the orthogonal matrix block [BLOCK_DMODEL, BLOCK_DMODEL]
+            # Assuming ortho_matrix is [head_dim, head_dim] and stored contiguously
+            ortho_offs_d1 = tl.arange(0, BLOCK_DMODEL)
+            ortho_offs_d2 = tl.arange(0, BLOCK_DMODEL)
+            ortho_mask = (ortho_offs_d1[:, None] < head_dim) & (ortho_offs_d2[None, :] < head_dim)
+            ortho_block = tl.load(
+                ortho_matrix_ptr + ortho_offs_d1[:, None] * head_dim + ortho_offs_d2[None, :],
+                mask=ortho_mask,
+                other=0.0
+            ) # Matrix is expected to be FP32
+            
+            # Apply transformation: q_block = q_block @ ortho_block
+            # Ensure shapes are compatible: [BLOCK_M, BLOCK_DMODEL] @ [BLOCK_DMODEL, BLOCK_DMODEL]
+            # Note: Triton matmul expects specific layouts/dtypes, may need casting/transposing
+            q_block = tl.dot(q_block, ortho_block, out_dtype=tl.float32)
         
         # Initialize accumulators for stable softmax algorithm
         # o: Output accumulator
@@ -137,6 +176,13 @@ if HAS_TRITON:
         o = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
         m_i = tl.full([BLOCK_M], value=-float('inf'), dtype=tl.float32)
         l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
+        
+        # Define offsets for the L and M tensors for the current block if storing
+        l_block_offset = 0
+        m_block_offset = 0
+        if STORE_L_M:
+            l_block_offset = (pid_batch * stride_lb + pid_head * stride_lh + pid_m * BLOCK_M * stride_lm)
+            m_block_offset = (pid_batch * stride_mb + pid_head * stride_mh + pid_m * BLOCK_M * stride_mm)
         
         # Loop over k, v blocks - this is the key to Flash Attention's memory efficiency
         # We process the sequence in chunks to avoid materializing the full attention matrix
@@ -160,16 +206,34 @@ if HAS_TRITON:
                 k_block_ptr + (tl.arange(0, BLOCK_N)[:, None] * stride_km +
                                tl.arange(0, BLOCK_DMODEL)[None, :] * stride_kd),
                 mask=kv_mask,
-                other=0.0
-            )
+                other=0.0,
+                eviction_policy="evict_first"
+            ).to(tl.float32) # Cast to float32
+            
+            # Apply orthogonal transformation if FP8 and enabled
+            if IS_FP8 and USE_ORTHO_MAT:
+                # Reload ortho_block if not already loaded or kept in registers
+                # Note: Re-loading might be inefficient; ideally, it's loaded once per kernel
+                # Or, if it's small enough, kept entirely in registers/shared memory.
+                # For simplicity here, we reload. Optimization needed.
+                ortho_offs_d1 = tl.arange(0, BLOCK_DMODEL)
+                ortho_offs_d2 = tl.arange(0, BLOCK_DMODEL)
+                ortho_mask = (ortho_offs_d1[:, None] < head_dim) & (ortho_offs_d2[None, :] < head_dim)
+                ortho_block = tl.load(
+                    ortho_matrix_ptr + ortho_offs_d1[:, None] * head_dim + ortho_offs_d2[None, :],
+                    mask=ortho_mask,
+                    other=0.0
+                ) # Matrix is expected to be FP32
+                k_block = tl.dot(k_block, ortho_block, out_dtype=tl.float32)
             
             # Load value block with masking for boundary conditions
             v_block = tl.load(
                 v_block_ptr + (tl.arange(0, BLOCK_N)[:, None] * stride_vm +
                                tl.arange(0, BLOCK_DMODEL)[None, :] * stride_vd),
                 mask=kv_mask,
-                other=0.0
-            )
+                other=0.0,
+                eviction_policy="evict_first"
+            ).to(tl.float32) # Cast V to FP32 as well, necessary for accumulation
             
             # Compute attention scores for this block: QK^T
             # Optimized matrix multiplication using Triton's tl.dot operation
@@ -240,6 +304,15 @@ if HAS_TRITON:
         # Final normalization of output by dividing by the sum of attention weights
         o = o / l_i[:, None]
         
+        # Store L and M statistics if requested (for backward pass)
+        if STORE_L_M:
+            # Create mask for storing L and M (only for valid query positions)
+            l_m_store_mask = (tl.arange(0, BLOCK_M) < q_valid_range)
+            # Store l_i for the current block
+            tl.store(l_ptr + l_block_offset + tl.arange(0, BLOCK_M), l_i, mask=l_m_store_mask)
+            # Store m_i for the current block
+            tl.store(m_ptr + m_block_offset + tl.arange(0, BLOCK_M), m_i, mask=l_m_store_mask)
+        
         # Calculate output mask for valid positions
         out_mask = (tl.arange(0, BLOCK_M)[:, None] < q_valid_range) & (tl.arange(0, BLOCK_DMODEL)[None, :] < head_dim)
         
@@ -249,7 +322,7 @@ if HAS_TRITON:
                                tl.arange(0, BLOCK_DMODEL)[None, :] * stride_od),
             o,
             mask=out_mask
-        )
+        ).to(tl_dtype) # Cast output back to original dtype (e.g., FP8)
 
     @triton.jit
     @triton.autotune(
@@ -265,7 +338,7 @@ if HAS_TRITON:
             triton.Config({'BLOCK_M': 128, 'BLOCK_N': 128, 'BLOCK_DMODEL': 128}, num_warps=8),
             triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_DMODEL': 64}, num_warps=8),
         ],
-        key=['batch_size', 'seq_len', 'hidden_size', 'num_heads', 'head_dim', 'CAUSAL', 'USE_MASK', 'HAS_BIAS'],
+        key=['batch_size', 'seq_len', 'hidden_size', 'num_heads', 'head_dim', 'CAUSAL', 'USE_MASK', 'HAS_BIAS', 'IS_FP8', 'USE_ORTHO_MAT'], # Add FP8 flags to key
         prune_configs_by={
             'batch_size': lambda n: n <= 32,  # Only attempt large blocks with small batches
             'seq_len': lambda n: n <= 8192,   # Constrain for very long sequences
@@ -293,7 +366,11 @@ if HAS_TRITON:
         BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
         BLOCK_N: tl.constexpr, CAUSAL: tl.constexpr,
         USE_MASK: tl.constexpr, USE_DROPOUT: tl.constexpr,
-        HAS_BIAS: tl.constexpr
+        HAS_BIAS: tl.constexpr,
+        # FP8 meta-parameters (potentially needed if fusing)
+        IS_FP8: tl.constexpr,
+        USE_ORTHO_MAT: tl.constexpr,
+        ortho_matrix_ptr # Optional pointer
     ):
         """
         Fully fused attention kernel that combines multiple operations:
@@ -604,7 +681,7 @@ if HAS_TRITON:
             offs_out_d[None, :] * stride_out_d,
             output,
             mask=out_mask
-        )
+        ).to(tl_dtype) # Cast output back to original dtype (e.g., FP8)
 
     @triton.jit
     @triton.autotune(
@@ -618,12 +695,14 @@ if HAS_TRITON:
             # Configurations for larger models or longer sequences
             triton.Config({'BLOCK_M': 256, 'BLOCK_N': 128, 'BLOCK_DMODEL': 64}, num_warps=8),
         ],
-        key=['batch_size', 'seq_len', 'num_heads', 'head_dim', 'CAUSAL', 'USE_MASK'],
+        key=['batch_size', 'seq_len', 'num_heads', 'head_dim', 'CAUSAL', 'USE_MASK', 'IS_FP8', 'USE_ORTHO_MAT'], # Add FP8 flags to key
     )
     def _flash_attention_backward_kernel(
         # Pointers to matrices
-        grad_output_ptr, q_ptr, k_ptr, v_ptr,
+        grad_output_ptr, q_ptr, k_ptr, v_ptr, o_ptr, # Need o_ptr for delta recomputation
         grad_q_ptr, grad_k_ptr, grad_v_ptr,
+        # L and m statistics from forward pass (or recomputed)
+        l_ptr, m_ptr, 
         # Optional attention mask
         mask_ptr,
         # Matrix dimensions
@@ -633,651 +712,439 @@ if HAS_TRITON:
         stride_qb, stride_qm, stride_qh, stride_qd,      # Q strides
         stride_kb, stride_km, stride_kh, stride_kd,      # K strides
         stride_vb, stride_vm, stride_vh, stride_vd,      # V strides
+        stride_ob, stride_om, stride_oh, stride_od,      # O strides
         stride_gqb, stride_gqm, stride_gqh, stride_gqd,  # Grad Q strides
         stride_gkb, stride_gkm, stride_gkh, stride_gkd,  # Grad K strides
         stride_gvb, stride_gvm, stride_gvh, stride_gvd,  # Grad V strides
+        stride_lb, stride_lh, stride_lm,                # L strides
+        stride_mb, stride_mh, stride_mm,                # m strides
         stride_maskb, stride_maskh, stride_maskm,        # Mask strides (if applicable)
         # Other parameters
         scale, 
         # Meta-parameters
         BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
         BLOCK_N: tl.constexpr, CAUSAL: tl.constexpr,
-        USE_MASK: tl.constexpr
+        USE_MASK: tl.constexpr,
+       # FP8 related meta-parameters (Needed if recomputing FP8 forward pass)
+       IS_FP8: tl.constexpr,
+       USE_ORTHO_MAT: tl.constexpr,
+       ortho_matrix_ptr # Optional pointer
     ):
         """
         Compute the backward pass of flash attention.
         
-        This kernel handles the efficient computation of gradients with respect to
-        query, key, and value tensors, avoiding materializing the full attention matrix.
-        
-        The backward pass of Flash Attention needs to:
-        1. Compute gradients with respect to output of attention (dO)
-        2. Recompute the attention weights by doing the forward pass again
-        3. Compute gradients with respect to Q, K, V:
-           - dQ = dO @ V^T * S  (where S is the attention weights)
-           - dK = dO^T @ Q * S
-           - dV = S^T @ dO
-        
-        Key optimizations:
-        - Process blocks to maintain O(sqrt(N)) memory complexity
-        - Recompute attention scores on-the-fly rather than storing them
-        - Use stable softmax for numerical precision
+        Follows the algorithm described in the FlashAttention-2 paper (Section 3.2).
+        Requires the output O and the softmax normalization statistics (L, m) 
+        from the forward pass, which might need to be recomputed if not passed in.
+        Handles FP8 with optional incoherent processing.
         """
         # Get program IDs for parallel processing
         pid_batch = tl.program_id(0)  # Batch index
         pid_head = tl.program_id(1)   # Head index
-        pid_m = tl.program_id(2)      # Block index for attention matrix
+        pid_m = tl.program_id(2)      # Block index for query sequence
         
-        # Compute offsets
-        # For current query block
+        # Compute offsets for the current block
         start_m = pid_m * BLOCK_M
-        q_offset = (pid_batch * stride_qb + 
-                   pid_head * stride_qh + 
-                   start_m * stride_qm)
-        
-        # For gradients of output
-        do_offset = (pid_batch * stride_dob + 
-                    pid_head * stride_doh + 
-                    start_m * stride_dom)
-        
-        # For gradients of Q, K, V
-        grad_q_offset = (pid_batch * stride_gqb + 
-                        pid_head * stride_gqh + 
-                        start_m * stride_gqm)
+        q_offset = (pid_batch * stride_qb + pid_head * stride_qh + start_m * stride_qm)
+        do_offset = (pid_batch * stride_dob + pid_head * stride_doh + start_m * stride_dom)
+        o_offset = (pid_batch * stride_ob + pid_head * stride_oh + start_m * stride_om)
+        grad_q_offset = (pid_batch * stride_gqb + pid_head * stride_gqh + start_m * stride_gqm)
+        l_offset = (pid_batch * stride_lb + pid_head * stride_lh + start_m * stride_lm) # Offset for l stat
+        m_offset = (pid_batch * stride_mb + pid_head * stride_mh + start_m * stride_mm) # Offset for m stat
         
         # Compute range of valid queries for this block (handle boundary)
         m_range = min(BLOCK_M, seq_len - start_m)
         
-        # Load Q block
-        q_block_ptr = q_ptr + q_offset
-        # Create offset arrays for loading Q
-        offs_m = tl.arange(0, BLOCK_M)
+        # Define offsets for the head dimension
         offs_d = tl.arange(0, BLOCK_DMODEL)
-        # Create mask for valid positions
-        q_mask = (offs_m[:, None] < m_range) & (offs_d[None, :] < head_dim)
-        # Load query block
-        q_block = tl.load(
-            q_block_ptr + (offs_m[:, None] * stride_qm + 
-                         offs_d[None, :] * stride_qd),
-            mask=q_mask,
-            other=0.0
-        )
+        offs_m = tl.arange(0, BLOCK_M)
         
+        # --- Load Inputs for the Block --- 
         # Load dO (gradient of output)
-        do_block_ptr = grad_output_ptr + do_offset
-        # Create mask for valid positions in dO
         do_mask = (offs_m[:, None] < m_range) & (offs_d[None, :] < head_dim)
-        # Load dO block
         do_block = tl.load(
-            do_block_ptr + (offs_m[:, None] * stride_dom + 
-                          offs_d[None, :] * stride_dod),
+            grad_output_ptr + do_offset + (offs_m[:, None] * stride_dom + offs_d[None, :] * stride_dod),
             mask=do_mask,
             other=0.0
-        )
+        ).to(tl.float32)
+
+        # Load O (output from forward pass)
+        o_mask = (offs_m[:, None] < m_range) & (offs_d[None, :] < head_dim)
+        o_block = tl.load(
+            o_ptr + o_offset + (offs_m[:, None] * stride_om + offs_d[None, :] * stride_od),
+            mask=o_mask,
+            other=0.0
+        ).to(tl.float32)
         
-        # Initialize gradient accumulators for Q
+        # Load l and m statistics for stable softmax recomputation
+        l_mask = (offs_m < m_range)
+        m_mask = (offs_m < m_range)
+        l_block = tl.load(l_ptr + l_offset + offs_m, mask=l_mask, other=0.0)
+        m_block = tl.load(m_ptr + m_offset + offs_m, mask=m_mask, other=-float('inf'))
+
+        # Load Q block
+        tl_q_dtype = tl.float8e4m3fn if IS_FP8 else q_ptr.dtype.element_ty
+        q_mask = (offs_m[:, None] < m_range) & (offs_d[None, :] < head_dim)
+        q_block = tl.load(
+            q_ptr + q_offset + (offs_m[:, None] * stride_qm + offs_d[None, :] * stride_qd),
+            mask=q_mask,
+            other=0.0
+        ).to(tl.float32)
+        
+        # --- Handle FP8 Orthogonal Transformation --- 
+        ortho_block = None
+        if IS_FP8 and USE_ORTHO_MAT:
+            # Load the orthogonal matrix once
+            ortho_offs_d1 = tl.arange(0, BLOCK_DMODEL)
+            ortho_offs_d2 = tl.arange(0, BLOCK_DMODEL)
+            ortho_mask = (ortho_offs_d1[:, None] < head_dim) & (ortho_offs_d2[None, :] < head_dim)
+            ortho_block = tl.load(
+                ortho_matrix_ptr + ortho_offs_d1[:, None] * head_dim + ortho_offs_d2[None, :],
+                mask=ortho_mask,
+                other=0.0
+            ) # Expects FP32 matrix
+            
+            # Apply transformation Q_transformed = Q @ Ortho
+            q_block = tl.dot(q_block, ortho_block, out_dtype=tl.float32)
+            # Note: o_block and do_block remain untransformed as they relate to the final output
+            
+        # --- Compute delta term --- 
+        # delta = rowsum(dO * O) [BLOCK_M]
+        delta = tl.sum(do_block * o_block, axis=1)
+
+        # --- Initialize Gradient Accumulators --- 
         grad_q = tl.zeros([BLOCK_M, BLOCK_DMODEL], dtype=tl.float32)
-        
-        # We need to recompute the attention weights for gradient computation
-        # This follows the same structure as the forward pass, but computing gradients
-        
-        # Initialize accumulators for the stable softmax algorithm
-        # (similar to forward pass, but for backward computation)
-        m_i = tl.full([BLOCK_M], float('-inf'), dtype=tl.float32)
-        l_i = tl.zeros([BLOCK_M], dtype=tl.float32)
-        
-        # First pass: Recompute attention scores and normalization constants
-        # We need to do this to get the correct softmax values for gradient computation
+
+        # --- Loop over Key/Value blocks --- 
         for start_n in range(0, seq_len, BLOCK_N):
             # Early termination check for causal masking
             if CAUSAL and start_n > (start_m + BLOCK_M - 1):
                 break
                 
-            # Compute range of valid keys for this block
+            # Compute range of valid keys/values for this block
             n_range = min(BLOCK_N, seq_len - start_n)
-            
-            # Load K block for current chunk
-            k_offset = (pid_batch * stride_kb + 
-                       pid_head * stride_kh + 
-                       start_n * stride_km)
-            k_block_ptr = k_ptr + k_offset
-            
-            # Create offset arrays for loading K
             offs_n = tl.arange(0, BLOCK_N)
-            # Create mask for valid K positions
-            k_mask = (offs_n[:, None] < n_range) & (offs_d[None, :] < head_dim)
+
+            # --- Load K and V blocks --- 
+            tl_kv_dtype = tl.float8e4m3fn if IS_FP8 else k_ptr.dtype.element_ty
             
-            # Load K block
+            k_offset = (pid_batch * stride_kb + pid_head * stride_kh + start_n * stride_km)
+            k_block_ptr = k_ptr + k_offset
+            k_mask = (offs_n[:, None] < n_range) & (offs_d[None, :] < head_dim)
             k_block = tl.load(
-                k_block_ptr + (offs_n[:, None] * stride_km + 
-                             offs_d[None, :] * stride_kd),
+                k_block_ptr + (offs_n[:, None] * stride_km + offs_d[None, :] * stride_kd),
                 mask=k_mask,
                 other=0.0
-            )
-            
-            # Compute attention scores for this block: QK^T
-            scores = tl.dot(q_block, tl.trans(k_block))
-            scores = scores * scale
-            
-            # Apply causal masking if needed
-            if CAUSAL:
-                # Compute absolute position indices for queries and keys
-                row_ids = start_m + offs_m
-                col_ids = start_n + offs_n
-                # Create causal mask (upper triangular)
-                causal_mask = row_ids[:, None] >= col_ids[None, :]
-                # Apply mask by setting masked scores to a large negative value
-                scores = scores * causal_mask + float('-inf') * ~causal_mask
-            
-            # Apply attention mask if provided
-            if USE_MASK:
-                # Calculate mask offset
-                mask_offset = (pid_batch * stride_maskb +
-                               pid_head * stride_maskh +
-                               start_m * stride_maskm)
-                
-                # Create mask for loading attention mask
-                mask_load_mask = (offs_m[:, None] < m_range) & (offs_n[None, :] < n_range)
-                
-                # Load attention mask
-                attn_mask = tl.load(
-                    mask_ptr + mask_offset + 
-                    (offs_m[:, None] * stride_maskm + offs_n[None, :]),
-                    mask=mask_load_mask,
-                    other=0.0
-                )
-                
-                # Apply mask (0 → -inf, 1 → keep value)
-                scores = scores * attn_mask + float('-inf') * (1.0 - attn_mask)
-            
-            # Compute block's max score for numerical stability
-            m_block = tl.max(scores, axis=1)
-            
-            # Update running max
-            m_i_new = tl.maximum(m_i, m_block)
-            
-            # Compute scaling factors and update normalization terms
-            exp_scores = tl.exp(scores - m_block[:, None])
-            l_block = tl.sum(exp_scores, axis=1)
-            
-            # Update normalizing constants
-            alpha = tl.exp(m_i - m_i_new)
-            l_i_new = alpha * l_i + l_block * tl.exp(m_block - m_i_new)
-            
-            # Update tracking variables
-            l_i = l_i_new
-            m_i = m_i_new
-        
-        # Second pass: Compute gradients for Q, K, V
-        # Now that we have the normalization constants, we can compute gradients
-        
-        # Initialize gradient accumulators for K and V
-        # These are accumulated across all query blocks
-        # Allocate space for K and V gradients for current block
-        grad_k_block = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
-        grad_v_block = tl.zeros([BLOCK_N, BLOCK_DMODEL], dtype=tl.float32)
-        
-        # Process each key/value block
-        for start_n in range(0, seq_len, BLOCK_N):
-            # Early termination for causal masking
-            if CAUSAL and start_n > (start_m + BLOCK_M - 1):
-                break
-                
-            # Compute range of valid keys for this block
-            n_range = min(BLOCK_N, seq_len - start_n)
-            
-            # Load K, V blocks for current chunk
-            k_offset = (pid_batch * stride_kb + 
-                       pid_head * stride_kh + 
-                       start_n * stride_km)
-            v_offset = (pid_batch * stride_vb + 
-                       pid_head * stride_vh + 
-                       start_n * stride_vm)
-            
-            k_block_ptr = k_ptr + k_offset
+            ).to(tl.float32)
+
+            v_offset = (pid_batch * stride_vb + pid_head * stride_vh + start_n * stride_vm)
             v_block_ptr = v_ptr + v_offset
-            
-            # Create masks for valid K, V positions
-            kv_mask = (offs_n[:, None] < n_range) & (offs_d[None, :] < head_dim)
-            
-            # Load K and V blocks
-            k_block = tl.load(
-                k_block_ptr + (offs_n[:, None] * stride_km + 
-                             offs_d[None, :] * stride_kd),
-                mask=kv_mask,
-                other=0.0
-            )
-            
+            v_mask = (offs_n[:, None] < n_range) & (offs_d[None, :] < head_dim)
             v_block = tl.load(
-                v_block_ptr + (offs_n[:, None] * stride_vm + 
-                             offs_d[None, :] * stride_vd),
-                mask=kv_mask,
+                v_block_ptr + (offs_n[:, None] * stride_vm + offs_d[None, :] * stride_vd),
+                mask=v_mask,
                 other=0.0
-            )
+            ).to(tl.float32)
             
-            # 1. Recompute attention weights (P) for this block
-            scores = tl.dot(q_block, tl.trans(k_block))
-            scores = scores * scale
+            # Apply orthogonal transformation to K if needed
+            if IS_FP8 and USE_ORTHO_MAT:
+                k_block = tl.dot(k_block, ortho_block, out_dtype=tl.float32)
             
-            # Apply causal masking if needed
+            # --- Recompute Scores and Softmax (P) --- 
+            # S = Q K^T (using potentially transformed Q and K)
+            scores = tl.dot(q_block, tl.trans(k_block), out_dtype=tl.float32) * scale
+
+            # Apply causal/attention masking
             if CAUSAL:
-                row_ids = start_m + offs_m
-                col_ids = start_n + offs_n
+                row_ids = start_m + tl.arange(0, BLOCK_M)
+                col_ids = start_n + tl.arange(0, BLOCK_N)
                 causal_mask = row_ids[:, None] >= col_ids[None, :]
-                scores = scores * causal_mask + float('-inf') * ~causal_mask
-            
-            # Apply attention mask if provided
+                scores = scores * causal_mask + (-1e9) * ~causal_mask
             if USE_MASK:
-                mask_offset = (pid_batch * stride_maskb +
-                               pid_head * stride_maskh +
-                               start_m * stride_maskm)
-                
+                # Load mask block - adjust strides/logic based on actual mask format
+                mask_offset = (pid_batch * stride_maskb + pid_head * stride_maskh + start_m * stride_maskm) 
                 mask_load_mask = (offs_m[:, None] < m_range) & (offs_n[None, :] < n_range)
-                
-                attn_mask = tl.load(
-                    mask_ptr + mask_offset + 
-                    (offs_m[:, None] * stride_maskm + offs_n[None, :]),
+                mask_block = tl.load(
+                    mask_ptr + (offs_m[:, None] * stride_maskm + offs_n[None, :]), # Check mask indexing
                     mask=mask_load_mask,
                     other=0.0
                 )
-                
-                scores = scores * attn_mask + float('-inf') * (1.0 - attn_mask)
+                scores = scores * mask_block + (-1e9) * (1.0 - mask_block)
             
-            # Compute attention weights with stable softmax
-            # P = exp(scores - m_i) / l_i
-            p = tl.exp(scores - m_i[:, None]) / l_i[:, None]
+            # P = softmax(S) using loaded l and m stats
+            # p = exp(S - m) / l
+            p = tl.exp(scores - m_block[:, None]) / l_block[:, None] # [BLOCK_M, BLOCK_N]
+            # Clamp P for stability if needed, e.g., p = tl.where(mask_load_mask, p, 0.0)
             
-            # 2. Compute gradients for Q
-            # dQ += dO @ V^T * P
-            grad_q += tl.dot(p, v_block)
+            # --- Compute Gradients for this block --- 
+            # Compute dV = P^T @ dO 
+            # Shapes: P^T [N, M], dO [M, D] -> dV [N, D]
+            grad_v_block = tl.dot(tl.trans(p), do_block, out_dtype=tl.float32)
             
-            # 3. Compute dS = dO @ V^T * P
-            # Start by computing dO @ V^T
-            dov = tl.dot(do_block, tl.trans(v_block))
+            # Compute dP = dO @ V^T
+            # Shapes: dO [M, D], V^T [D, N] -> dP [M, N]
+            dp = tl.dot(do_block, tl.trans(v_block), out_dtype=tl.float32)
             
-            # 4. Compute gradient through softmax: dP = dS - P * sum(dS * P)
-            # First compute weighted sum
-            dp_sum = tl.sum(dov * p, axis=1, keepdims=True)
+            # Compute dS = P * (dP - delta)
+            ds = p * (dp - delta[:, None]) # delta[M] broadcast to [M, N]
+
+            # Compute dK = dS^T @ Q
+            # Shapes: dS^T [N, M], Q [M, D] -> dK [N, D]
+            # Q is potentially transformed Q_transformed
+            grad_k_block = tl.dot(tl.trans(ds), q_block, out_dtype=tl.float32)
             
-            # Then compute dP
-            dp = dov - p * dp_sum
+            # Compute dQ contribution from this block: dQ += dS @ K
+            # Shapes: dS [M, N], K [N, D] -> dQ_contrib [M, D]
+            # K is potentially transformed K_transformed
+            grad_q += tl.dot(ds, k_block, out_dtype=tl.float32)
             
-            # 5. Compute gradients for K and V
-            # dK += Q^T @ dP
-            # dV += P^T @ dO
-            # Compute gradient contributions for this block
-            dk_block = tl.dot(tl.trans(dp), q_block) * scale
-            dv_block = tl.dot(tl.trans(p), do_block)
+            # --- Atomically Add dV and dK to Global Gradients --- 
+            grad_v_offset = (pid_batch * stride_gvb + pid_head * stride_gvh + start_n * stride_gvm)
+            grad_k_offset = (pid_batch * stride_gkb + pid_head * stride_gkh + start_n * stride_gkm)
+           
+            grad_v_block_ptr = grad_v_ptr + grad_v_offset
+            grad_k_block_ptr = grad_k_ptr + grad_k_offset
+           
+            store_mask = (offs_n[:, None] < n_range) & (offs_d[None, :] < head_dim)
             
-            # 6. Add to the gradient accumulators for K and V
-            # Note: Here we need to accumulate properly, handling potential overlapping blocks
-            grad_k_block += dk_block
-            grad_v_block += dv_block
+            # Store dV (no transformation needed)
+            # Accumulation happens across block_m, potentially requiring atomics
+            tl.atomic_add(grad_v_block_ptr + (offs_n[:, None] * stride_gvm + offs_d[None, :] * stride_gvd), grad_v_block, mask=store_mask)
             
-            # 7. Write back gradients for K and V
-            # Compute offset for gradient of K and V
-            grad_k_offset = (pid_batch * stride_gkb + 
-                            pid_head * stride_gkh + 
-                            start_n * stride_gkm)
-            
-            grad_v_offset = (pid_batch * stride_gvb + 
-                            pid_head * stride_gvh + 
-                            start_n * stride_gvm)
-            
-            # Create masks for writing K, V gradients
-            grad_kv_mask = (offs_n[:, None] < n_range) & (offs_d[None, :] < head_dim)
-            
-            # Atomically add gradient contributions for K
-            tl.atomic_add(
-                grad_k_ptr + grad_k_offset + 
-                (offs_n[:, None] * stride_gkm + offs_d[None, :] * stride_gkd),
-                dk_block,
-                mask=grad_kv_mask
-            )
-            
-            # Atomically add gradient contributions for V
-            tl.atomic_add(
-                grad_v_ptr + grad_v_offset + 
-                (offs_n[:, None] * stride_gvm + offs_d[None, :] * stride_gvd),
-                dv_block,
-                mask=grad_kv_mask
-            )
-        
-        # 8. Write back gradients for Q
-        # Create mask for writing Q gradients
+            # Store dK (gradient w.r.t potentially transformed K)
+            # Accumulation happens across block_m, potentially requiring atomics
+            tl.atomic_add(grad_k_block_ptr + (offs_n[:, None] * stride_gkm + offs_d[None, :] * stride_gkd), grad_k_block, mask=store_mask)
+            # TODO: Inverse transform for dK needs to happen *after* all atomic adds complete.
+            # This is complex and might require a separate kernel or careful synchronization.
+            # It cannot be done correctly within this loop if USE_ORTHO_MAT is true.
+
+        # --- End of Loop --- 
+
+        # --- Finalize and Store dQ --- 
+        # Apply inverse orthogonal transformation to dQ if needed
+        if IS_FP8 and USE_ORTHO_MAT:
+            # grad_q currently holds dQ w.r.t Q_transformed
+            # We need dQ w.r.t Q_original = dQ @ Ortho^T
+            grad_q = tl.dot(grad_q, tl.trans(ortho_block), out_dtype=tl.float32)
+
+        # Write final dQ gradient
+        grad_q_block_ptr = grad_q_ptr + grad_q_offset
         grad_q_mask = (offs_m[:, None] < m_range) & (offs_d[None, :] < head_dim)
-        
-        # Write Q gradients
+
+        # Store final dQ (converting back to original Q dtype if necessary)
         tl.store(
-            grad_q_ptr + grad_q_offset + 
-            (offs_m[:, None] * stride_gqm + offs_d[None, :] * stride_gqd),
-            grad_q,
+            grad_q_block_ptr + (offs_m[:, None] * stride_gqm + offs_d[None, :] * stride_gqd), \
+            grad_q.to(tl_q_dtype), # Cast to original type (e.g., FP8)
             mask=grad_q_mask
         )
 
 
 #-----------------------------------------------------------------------------
-# Python Wrapper Functions
+# Python Wrappers for Triton Kernels
 #-----------------------------------------------------------------------------
 
-class _FlashAttentionFunction(torch.autograd.Function):
-    """
-    Autograd function for Flash Attention to enable more efficient backward pass.
-    
-    This implementation builds on the Flash Attention algorithm, ensuring memory
-    efficiency in both forward and backward passes.
-    """
-    
-    @staticmethod
-    def forward(
-        ctx, 
-        q: torch.Tensor,
-        k: torch.Tensor,
-        v: torch.Tensor,
-        mask: Optional[torch.Tensor],
-        causal: bool,
-        softmax_scale: float,
-        dropout_p: float,
-        return_softmax: bool,
-        block_size: int
-    ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
-        """
-        Forward pass for Flash Attention.
+if HAS_TRITON:
+    class _FlashAttentionFunction(torch.autograd.Function):
+        """Flash Attention implemented via Triton kernels, supporting FP8."""
         
-        Args:
-            q, k, v: Query, key, value tensors
-            mask: Optional attention mask
-            causal: Whether to use causal masking
-            softmax_scale: Scale factor for softmax
-            dropout_p: Dropout probability
-            return_softmax: Whether to return softmax weights
-            block_size: Block size for tiling
+        @staticmethod
+        def forward(ctx, q, k, v, mask, causal, softmax_scale, dropout_p, 
+                    return_softmax, block_size, precision, ortho_matrix):
+            """Forward pass calling the Triton kernel."""
+            # Determine if L/m need to be stored (if any input requires grad)
+            store_l_m = q.requires_grad or k.requires_grad or v.requires_grad
+
+            # Input checks are mostly handled by the calling function (triton_flash_attention)
+            batch_size, seq_len, num_heads, head_dim = q.shape
+            scale = softmax_scale if softmax_scale is not None else (1.0 / math.sqrt(head_dim))
             
-        Returns:
-            output: Attention output
-            (Optional) attention_weights: If return_softmax=True, returns attention weights
-        """
-        if not HAS_TRITON:
-            # Use PyTorch implementation if Triton is not available
-            output = pytorch_flash_attention(q, k, v, mask, causal, softmax_scale, 
-                                          dropout_p, return_softmax)
-            if return_softmax:
-                ctx.save_for_backward(q, k, v, output[0], output[1])
-                ctx.softmax_scale = softmax_scale
-                ctx.causal = causal
-                ctx.mask = mask
-                return output[0], output[1]
-            else:
-                ctx.save_for_backward(q, k, v, output)
-                ctx.softmax_scale = softmax_scale
-                ctx.causal = causal
-                ctx.mask = mask
-                return output
-        
-        # Extract dimensions
-        batch_size, seq_len, num_heads, head_dim = q.shape
-        
-        # Set softmax scale if not provided
-        if softmax_scale is None:
-            softmax_scale = 1.0 / math.sqrt(head_dim)
-        
-        # Create output tensor
-        output = torch.empty_like(q)
-        
-        # Prepare attention mask if provided
-        use_mask = mask is not None
-        if use_mask:
-            # Ensure mask has the right shape
-            if mask.dim() == 2:  # [batch_size, seq_len]
-                mask = mask.unsqueeze(1).unsqueeze(2)  # [batch_size, 1, 1, seq_len]
-            elif mask.dim() == 3 and mask.shape[1] == 1:  # [batch_size, 1, seq_len]
-                mask = mask.unsqueeze(2)  # [batch_size, 1, 1, seq_len]
-            elif mask.dim() == 3:  # [batch_size, seq_len, seq_len]
-                mask = mask.unsqueeze(1)  # [batch_size, 1, seq_len, seq_len]
+            # Prepare output tensor and L, m tensors for backward pass
+            output = torch.empty_like(q, dtype=q.dtype)
+            # Allocate L, m only if needed for backward pass
+            l = torch.empty((batch_size, num_heads, seq_len), device=q.device, dtype=torch.float32) if store_l_m else None
+            m = torch.full((batch_size, num_heads, seq_len), -float('inf'), device=q.device, dtype=torch.float32) if store_l_m else None
             
-            # Convert bool mask to float
-            if mask.dtype == torch.bool:
-                mask = mask.to(torch.float32)
-        
-        # Determine optimal block size
-        if block_size > 256:
-            # For very long sequences, use smaller blocks to avoid shared memory limits
-            if seq_len > 4096:
-                block_size = 64
-            elif seq_len > 2048:
-                block_size = 128
-            else:
-                block_size = 256
-        
-        # Ensure block size doesn't exceed sequence length
-        block_size = min(block_size, seq_len)
-        
-        # Determine grid dimensions
-        grid = (
-            batch_size,                          # Batch dimension
-            num_heads,                           # Head dimension
-            triton.cdiv(seq_len, block_size)     # Sequence dimension
-        )
-        
-        # Compute attention with Triton kernel
-        _flash_attention_forward_kernel[grid](
-            q, k, v, output, mask if use_mask else torch.empty(0, device=q.device),
-            batch_size, seq_len, num_heads, head_dim,
-            q.stride(0), q.stride(2), q.stride(1), q.stride(3),
-            k.stride(0), k.stride(2), k.stride(1), k.stride(3),
-            v.stride(0), v.stride(2), v.stride(1), v.stride(3),
-            output.stride(0), output.stride(2), output.stride(1), output.stride(3),
-            mask.stride(0) if use_mask else 0,
-            mask.stride(1) if use_mask else 0,
-            mask.stride(3) if use_mask else 0,
-            softmax_scale,
-            BLOCK_M=block_size,
-            BLOCK_DMODEL=head_dim,
-            BLOCK_N=block_size,
-            CAUSAL=causal,
-            USE_MASK=use_mask
-        )
-        
-        # Apply dropout if needed
-        if dropout_p > 0.0 and q.is_cuda:
-            dropout_mask = torch.empty_like(output).bernoulli_(1 - dropout_p)
-            dropout_mask = dropout_mask / (1 - dropout_p)
-            output = output * dropout_mask
-        
-        # Save tensors needed for backward pass
-        ctx.save_for_backward(q, k, v)
-        ctx.softmax_scale = softmax_scale
-        ctx.causal = causal
-        ctx.mask = mask if use_mask else None
-        ctx.block_size = block_size
-        
-        # For return_softmax, we need to calculate the attention weights
-        if return_softmax:
-            # Calculate attention scores and weights (only for visualization)
-            with torch.no_grad():
-                scores = torch.einsum("bshd,bkhd->bhsk", q, k) * softmax_scale
-                
-                if causal:
-                    causal_mask = torch.triu(
-                        torch.ones(seq_len, seq_len, device=scores.device, dtype=torch.bool),
-                        diagonal=1
-                    )
-                    scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
-                
-                if use_mask:
-                    scores.masked_fill_(~mask.bool(), -1e9)
-                
-                attn_weights = torch.softmax(scores, dim=-1)
-                
-                if dropout_p > 0.0:
-                    attn_weights = F.dropout(attn_weights, p=dropout_p)
+            # Prepare mask pointer and strides
+            mask_ptr = 0
+            stride_maskb, stride_maskh, stride_maskm = 0, 0, 0
+            USE_MASK = (mask is not None)
+            if USE_MASK:
+                mask = mask.contiguous() # Ensure contiguous
+                mask_ptr = mask.data_ptr()
+                # Simplified stride calculation - needs refinement based on mask format
+                stride_maskb = mask.stride(0) if mask.dim() > 0 else 0
+                stride_maskh = mask.stride(1) if mask.dim() > 1 else 0 # Assuming B, H, ... format potential
+                stride_maskm = mask.stride(2) if mask.dim() > 2 else 0 # Assuming B, H, M, ... format potential
+
+            # --- FP8 Handling ---
+            IS_FP8 = (precision == "fp8")
+            USE_ORTHO_MAT = (IS_FP8 and ortho_matrix is not None)
+            ortho_matrix_ptr = 0
+            if USE_ORTHO_MAT:
+                # Validation done in launcher, assume ortho_matrix is valid FP32 contiguous tensor here
+                ortho_matrix_ptr = ortho_matrix.data_ptr()
+            # --- End FP8 Handling ---
+
+            # Grid dimensions
+            # TODO: Need separate BLOCK_M for forward kernel grid calculation
+            # Using fixed 128 for now, but should ideally use autotuner result or config
+            grid_m_block = 128 
+            grid = (batch_size, num_heads, triton.cdiv(seq_len, grid_m_block))
             
-            return output, attn_weights
-        else:
-            return output
-    
-    @staticmethod
-    def backward(
-        ctx, 
-        grad_output: torch.Tensor, 
-        *args
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, None, None, None, None, None, None]:
-        """
-        Backward pass for Flash Attention.
-        
-        Computes gradients with respect to query, key, and value tensors.
-        
-        Args:
-            grad_output: Gradients flowing from downstream layers
-            
-        Returns:
-            grad_q, grad_k, grad_v: Gradients for query, key, value
-            None for other inputs (they're not differentiable parameters)
-        """
-        # Retrieve saved tensors and context
-        q, k, v = ctx.saved_tensors
-        softmax_scale = ctx.softmax_scale
-        causal = ctx.causal
-        mask = ctx.mask
-        
-        # Extract dimensions
-        batch_size, seq_len, num_heads, head_dim = q.shape
-        
-        # Initialize gradient tensors
-        grad_q = torch.zeros_like(q)
-        grad_k = torch.zeros_like(k)
-        grad_v = torch.zeros_like(v)
-        
-        # If Triton is not available, fall back to PyTorch
-        if not HAS_TRITON:
-            # For a PyTorch implementation, we would compute full attention scores
-            # and apply the chain rule through softmax and matmul operations
-            # This is not memory-efficient but serves as a fallback
-            
-            # Compute attention scores
-            scores = torch.einsum("bshd,bkhd->bhsk", q, k) * softmax_scale
-            
-            # Apply masking
-            if causal:
-                causal_mask = torch.triu(
-                    torch.ones(seq_len, seq_len, device=scores.device, dtype=torch.bool),
-                    diagonal=1
-                )
-                scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
-            
-            if mask is not None:
-                scores.masked_fill_(~mask.bool(), -1e9)
-            
-            # Compute attention weights
-            attn_weights = torch.softmax(scores, dim=-1)
-            
-            # Compute gradients (standard autograd)
-            # dV = attn_weights^T * dO
-            grad_v = torch.einsum("bhsk,bshd->bkhd", attn_weights, grad_output)
-            
-            # dP = dO * V^T
-            do_v = torch.einsum("bshd,bkhd->bhsk", grad_output, v)
-            
-            # Gradient through softmax
-            ds = do_v * attn_weights
-            ds = ds - attn_weights * torch.sum(ds, dim=-1, keepdim=True)
-            
-            # dQ = dS * K, dK = dS^T * Q
-            grad_q = torch.einsum("bhsk,bkhd->bshd", ds, k) * softmax_scale
-            grad_k = torch.einsum("bhks,bshd->bkhd", ds, q) * softmax_scale
-            
-            return grad_q, grad_k, grad_v, None, None, None, None, None, None
-        
-        # For Triton implementation, use the backward kernel
-        use_mask = mask is not None
-        block_size = getattr(ctx, 'block_size', 128)
-        
-        # Ensure block size is optimal
-        if block_size > 256:
-            if seq_len > 4096:
-                block_size = 64
-            elif seq_len > 2048:
-                block_size = 128
-            else:
-                block_size = 256
-        
-        # Ensure block size doesn't exceed sequence length
-        block_size = min(block_size, seq_len)
-        
-        # Define grid dimensions for parallel execution
-        grid = (
-            batch_size,                          # Batch dimension
-            num_heads,                           # Head dimension
-            triton.cdiv(seq_len, block_size)     # Sequence dimension
-        )
-        
-        # Launch backward kernel
-        mask_ptr = mask if use_mask else torch.empty(0, device=q.device)
-        
-        try:
-            _flash_attention_backward_kernel[grid](
-                # Pointers to tensors
-                grad_output, q, k, v, grad_q, grad_k, grad_v, mask_ptr,
-                # Dimensions
-                batch_size, seq_len, num_heads, head_dim,
-                # Strides - gradient
-                grad_output.stride(0), grad_output.stride(1), grad_output.stride(2), grad_output.stride(3),
-                # Strides - Q, K, V
-                q.stride(0), q.stride(1), q.stride(2), q.stride(3),
-                k.stride(0), k.stride(1), k.stride(2), k.stride(3),
-                v.stride(0), v.stride(1), v.stride(2), v.stride(3),
-                # Strides - gradient Q, K, V
-                grad_q.stride(0), grad_q.stride(1), grad_q.stride(2), grad_q.stride(3),
-                grad_k.stride(0), grad_k.stride(1), grad_k.stride(2), grad_k.stride(3),
-                grad_v.stride(0), grad_v.stride(1), grad_v.stride(2), grad_v.stride(3),
-                # Mask strides
-                mask.stride(0) if use_mask else 0,
-                mask.stride(1) if use_mask else 0,
-                mask.stride(3) if use_mask else 0,
-                # Parameters
-                softmax_scale,
-                # Meta-parameters
-                BLOCK_M=block_size,
-                BLOCK_DMODEL=head_dim,
-                BLOCK_N=block_size,
+            # Launch forward kernel (Now includes L and m pointers)
+            _flash_attention_forward_kernel[grid](
+                q_ptr=q.data_ptr(), k_ptr=k.data_ptr(), v_ptr=v.data_ptr(), o_ptr=output.data_ptr(),
+                l_ptr=l.data_ptr() if store_l_m else 0, m_ptr=m.data_ptr() if store_l_m else 0, # Pass L and m pointers
+                mask_ptr=mask_ptr,
+                batch_size=batch_size, seq_len=seq_len, num_heads=num_heads, head_dim=head_dim,
+                stride_qb=q.stride(0), stride_qh=q.stride(2), stride_qm=q.stride(1), stride_qd=q.stride(3),
+                stride_kb=k.stride(0), stride_kh=k.stride(2), stride_km=k.stride(1), stride_kd=k.stride(3),
+                stride_vb=v.stride(0), stride_vh=v.stride(2), stride_vm=v.stride(1), stride_vd=v.stride(3),
+                stride_ob=output.stride(0), stride_oh=output.stride(2), stride_om=output.stride(1), stride_od=output.stride(3),
+                stride_lb=l.stride(0) if store_l_m else 0, stride_lh=l.stride(1) if store_l_m else 0, stride_lm=l.stride(2) if store_l_m else 0, # L strides
+                stride_mb=m.stride(0) if store_l_m else 0, stride_mh=m.stride(1) if store_l_m else 0, stride_mm=m.stride(2) if store_l_m else 0, # m strides
+                stride_maskb=stride_maskb, stride_maskh=stride_maskh, stride_maskm=stride_maskm,
+                scale=scale,
+                # BLOCK_M, BLOCK_N, BLOCK_DMODEL from autotuner config
                 CAUSAL=causal,
-                USE_MASK=use_mask
+                USE_MASK=USE_MASK,
+                IS_FP8=IS_FP8,
+                USE_ORTHO_MAT=USE_ORTHO_MAT,
+                STORE_L_M=store_l_m, # Pass flag to kernel
+                ortho_matrix_ptr=ortho_matrix_ptr,
+                # Pass L/m pointers and strides only if they were allocated
+                l_ptr=l.data_ptr() if store_l_m else 0, 
+                m_ptr=m.data_ptr() if store_l_m else 0,
+                stride_lb=l.stride(0) if store_l_m else 0,
+                stride_lh=l.stride(1) if store_l_m else 0,
+                stride_lm=l.stride(2) if store_l_m else 0,
+                stride_mb=m.stride(0) if store_l_m else 0,
+                stride_mh=m.stride(1) if store_l_m else 0,
+                stride_mm=m.stride(2) if store_l_m else 0
             )
-        except Exception as e:
-            print(f"Error in backward kernel: {e}")
-            print("Falling back to PyTorch implementation for backward pass")
             
-            # Compute attention scores
-            scores = torch.einsum("bshd,bkhd->bhsk", q, k) * softmax_scale
+            # Save tensors for backward pass
+            # Conditionally save tensors based on requires_grad and FP8 usage
+            tensors_to_save = [q, k, v, output]
+            if store_l_m:
+                tensors_to_save.extend([l, m])
+            # Only save ortho_matrix if it was actually used (FP8 and provided)
+            if USE_ORTHO_MAT and ortho_matrix is not None:
+                tensors_to_save.append(ortho_matrix)
+            ctx.save_for_backward(*tensors_to_save)
             
-            # Apply masking
-            if causal:
-                causal_mask = torch.triu(
-                    torch.ones(seq_len, seq_len, device=scores.device, dtype=torch.bool),
-                    diagonal=1
-                )
-                scores.masked_fill_(causal_mask.unsqueeze(0).unsqueeze(0), -1e9)
+            ctx.store_l_m = store_l_m # Save the flag for backward logic
+            ctx.use_ortho_mat = USE_ORTHO_MAT # Save the flag for backward logic
+            ctx.causal = causal
+            ctx.softmax_scale = scale
+            ctx.precision = precision
+            ctx.use_mask = USE_MASK
+            ctx.mask = mask # Save mask itself if needed for backward masking logic
             
-            if mask is not None:
-                scores.masked_fill_(~mask.bool(), -1e9)
+            # TODO: Handle return_softmax correctly if needed
+            if return_softmax:
+                raise NotImplementedError("Returning softmax weights not yet implemented in Triton kernel")
             
-            # Compute attention weights
-            attn_weights = torch.softmax(scores, dim=-1)
+            return output
+
+        @staticmethod
+        def backward(ctx, grad_output):
+            """Backward pass calling the Triton backward kernel."""
+            # Unpack saved tensors based on flags saved in forward context
+            saved_tensors = ctx.saved_tensors
+            q, k, v, output = saved_tensors[:4] # Q, K, V, O are always saved
+            saved_idx = 4
             
-            # Compute gradients
-            grad_v = torch.einsum("bhsk,bshd->bkhd", attn_weights, grad_output)
+            # Load L, m if they were saved
+            if ctx.store_l_m:
+                l, m = saved_tensors[saved_idx:saved_idx+2]
+                saved_idx += 2
+            else:
+                # L and m are required for backward, raise error or recompute? Recompute is safer but slower.
+                # For now, assume they MUST be available if requires_grad is true.
+                raise RuntimeError("Internal Error: L and m required for backward but not found in saved tensors.")
+
+            # Load ortho_matrix if it was saved
+            ortho_matrix = None
+            if ctx.use_ortho_mat:
+                if saved_idx < len(saved_tensors):
+                    ortho_matrix = saved_tensors[saved_idx]
+                    saved_idx += 1
+                else:
+                    # This indicates an issue if use_ortho_mat was true but matrix wasn't saved
+                    raise RuntimeError("Internal Error: Orthogonal matrix required but not found in saved tensors.")
+
+            causal = ctx.causal
+            scale = ctx.softmax_scale
+            precision = ctx.precision # Get precision from context
+            use_mask = ctx.use_mask
+            mask = ctx.mask
             
-            do_v = torch.einsum("bshd,bkhd->bhsk", grad_output, v)
+            # Input checks
+            if not grad_output.is_contiguous():
+                grad_output = grad_output.contiguous()
             
-            # Gradient through softmax
-            ds = do_v * attn_weights
-            ds = ds - attn_weights * torch.sum(ds, dim=-1, keepdim=True)
+            batch_size, seq_len, num_heads, head_dim = q.shape
             
-            grad_q = torch.einsum("bhsk,bkhd->bshd", ds, k) * softmax_scale
-            grad_k = torch.einsum("bhks,bshd->bkhd", ds, q) * softmax_scale
-        
-        # Return gradients and None for non-differentiable inputs
-        return grad_q, grad_k, grad_v, None, None, None, None, None, None
+            # Allocate gradient tensors (matching input dtypes, including FP8)
+            grad_q = torch.zeros_like(q, dtype=q.dtype)
+            grad_k = torch.zeros_like(k, dtype=k.dtype)
+            grad_v = torch.zeros_like(v, dtype=v.dtype)
+            
+            # Prepare mask pointer and strides for backward
+            mask_ptr = 0
+            stride_maskb, stride_maskh, stride_maskm = 0, 0, 0
+            if use_mask and mask is not None:
+                 mask_ptr = mask.data_ptr()
+                 stride_maskb = mask.stride(0) if mask.dim() > 0 else 0
+                 stride_maskh = mask.stride(1) if mask.dim() > 1 else 0 
+                 stride_maskm = mask.stride(2) if mask.dim() > 2 else 0
+                 
+            # --- FP8 Handling --- 
+            IS_FP8 = (precision == "fp8")
+            USE_ORTHO_MAT = (IS_FP8 and ortho_matrix is not None)
+            ortho_matrix_ptr = 0
+            if USE_ORTHO_MAT:
+                # Ortho matrix should already be FP32 contiguous from forward
+                ortho_matrix_ptr = ortho_matrix.data_ptr()
+            # --- End FP8 Handling ---
+            
+            # Grid dimensions for backward kernel
+            # TODO: Needs separate BLOCK_M for backward kernel grid calculation
+            grid_m_block_bwd = 128 # Use fixed 128 for now
+            grid = (batch_size, num_heads, triton.cdiv(seq_len, grid_m_block_bwd))
+            
+            # Launch backward kernel
+            _flash_attention_backward_kernel[grid](
+                grad_output_ptr=grad_output.data_ptr(), 
+                q_ptr=q.data_ptr(), k_ptr=k.data_ptr(), v_ptr=v.data_ptr(), o_ptr=output.data_ptr(),
+                grad_q_ptr=grad_q.data_ptr(), grad_k_ptr=grad_k.data_ptr(), grad_v_ptr=grad_v.data_ptr(),
+                l_ptr=l.data_ptr(), m_ptr=m.data_ptr(), 
+                mask_ptr=mask_ptr,
+                batch_size=batch_size, seq_len=seq_len, num_heads=num_heads, head_dim=head_dim,
+                stride_dob=grad_output.stride(0), stride_dom=grad_output.stride(1), stride_doh=grad_output.stride(2), stride_dod=grad_output.stride(3),
+                stride_qb=q.stride(0), stride_qm=q.stride(1), stride_qh=q.stride(2), stride_qd=q.stride(3),
+                stride_kb=k.stride(0), stride_km=k.stride(1), stride_kh=k.stride(2), stride_kd=k.stride(3),
+                stride_vb=v.stride(0), stride_vm=v.stride(1), stride_vh=v.stride(2), stride_vd=v.stride(3),
+                stride_ob=output.stride(0), stride_om=output.stride(1), stride_oh=output.stride(2), stride_od=output.stride(3),
+                stride_gqb=grad_q.stride(0), stride_gqm=grad_q.stride(1), stride_gqh=grad_q.stride(2), stride_gqd=grad_q.stride(3),
+                stride_gkb=grad_k.stride(0), stride_gkm=grad_k.stride(1), stride_gkh=grad_k.stride(2), stride_gkd=grad_k.stride(3),
+                stride_gvb=grad_v.stride(0), stride_gvm=grad_v.stride(1), stride_gvh=grad_v.stride(2), stride_gvd=grad_v.stride(3),
+                stride_lb=l.stride(0), stride_lh=l.stride(1), stride_lm=l.stride(2),
+                stride_mb=m.stride(0), stride_mh=m.stride(1), stride_mm=m.stride(2),
+                stride_maskb=stride_maskb, stride_maskh=stride_maskh, stride_maskm=stride_maskm,
+                scale=scale,
+                # BLOCK_M, BLOCK_N, BLOCK_DMODEL from autotuner config
+                CAUSAL=causal,
+                USE_MASK=use_mask,
+                IS_FP8=IS_FP8,
+                USE_ORTHO_MAT=USE_ORTHO_MAT,
+                ortho_matrix_ptr=ortho_matrix_ptr
+            )
+
+            # Return gradients for q, k, v, and None for other inputs 
+            # (mask, causal, softmax_scale, dropout_p, return_softmax, block_size, precision, ortho_matrix)
+            return grad_q, grad_k, grad_v, None, None, None, None, None, None, None, None
 
 
 def triton_flash_attention(
@@ -1318,7 +1185,7 @@ def triton_flash_attention(
     # Use autograd-enabled implementation for training
     if q.requires_grad or k.requires_grad or v.requires_grad:
         return _FlashAttentionFunction.apply(
-            q, k, v, mask, causal, softmax_scale, dropout_p, return_softmax, block_size
+            q, k, v, mask, causal, softmax_scale, dropout_p, return_softmax, block_size, "fp8", None
         )
     
     # Validate input tensors
@@ -1436,7 +1303,10 @@ def triton_flash_attention(
             BLOCK_DMODEL=head_dim,
             BLOCK_N=block_size,
             CAUSAL=causal,
-            USE_MASK=use_mask
+            USE_MASK=use_mask,
+            IS_FP8=False,
+            USE_ORTHO_MAT=False,
+            ortho_matrix_ptr=0
         )
     except Exception as e:
         print(f"Triton kernel launch failed with error: {e}")
@@ -1658,7 +1528,10 @@ def triton_fused_attention(
             CAUSAL=causal,
             USE_MASK=use_mask,
             USE_DROPOUT=use_dropout,
-            HAS_BIAS=has_bias
+            HAS_BIAS=has_bias,
+            IS_FP8=False,
+            USE_ORTHO_MAT=False,
+            ortho_matrix_ptr=0
         )
         return output
     except Exception as e:
