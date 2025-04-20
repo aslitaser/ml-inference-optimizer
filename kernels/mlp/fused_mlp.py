@@ -76,16 +76,56 @@ class FusedMLP(nn.Module):
         Forward pass using Triton kernels for acceleration.
         
         Args:
-            hidden_states: Input tensor
+            hidden_states: Input tensor [batch_size, seq_len, hidden_size]
             
         Returns:
-            Output tensor
+            Output tensor [batch_size, seq_len, hidden_size]
         """
+        # Verify input tensor shape and type
+        if hidden_states.dim() != 3:
+            raise ValueError(f"Expected 3D input tensor, got shape: {hidden_states.shape}")
+        
+        # Check if tensor is on CUDA (required for Triton)
+        if not hidden_states.is_cuda:
+            raise ValueError("Input tensor must be on a CUDA device for Triton kernels")
+        
         # Get weights and biases
         fc1_weight = self.fc1.weight
-        fc1_bias = self.fc1.bias
+        fc1_bias = self.fc1.bias if self.fc1.bias is not None else None
         fc2_weight = self.fc2.weight
-        fc2_bias = self.fc2.bias
+        fc2_bias = self.fc2.bias if self.fc2.bias is not None else None
+        
+        # Ensure weights and biases are on the same device as input
+        fc1_weight = fc1_weight.to(hidden_states.device)
+        fc2_weight = fc2_weight.to(hidden_states.device)
+        if fc1_bias is not None:
+            fc1_bias = fc1_bias.to(hidden_states.device)
+        if fc2_bias is not None:
+            fc2_bias = fc2_bias.to(hidden_states.device)
+        
+        # Convert to the correct dtype if needed (Triton kernels may require specific dtypes)
+        input_dtype = hidden_states.dtype
+        if self.config.precision == "fp16" and input_dtype != torch.float16:
+            hidden_states = hidden_states.to(torch.float16)
+            fc1_weight = fc1_weight.to(torch.float16)
+            fc2_weight = fc2_weight.to(torch.float16)
+            if fc1_bias is not None:
+                fc1_bias = fc1_bias.to(torch.float16)
+            if fc2_bias is not None:
+                fc2_bias = fc2_bias.to(torch.float16)
+        elif self.config.precision == "bf16" and input_dtype != torch.bfloat16:
+            hidden_states = hidden_states.to(torch.bfloat16)
+            fc1_weight = fc1_weight.to(torch.bfloat16)
+            fc2_weight = fc2_weight.to(torch.bfloat16)
+            if fc1_bias is not None:
+                fc1_bias = fc1_bias.to(torch.bfloat16)
+            if fc2_bias is not None:
+                fc2_bias = fc2_bias.to(torch.bfloat16)
+        
+        # Check if fused_mlp_forward function is available
+        if fused_mlp_forward is None:
+            raise RuntimeError("Triton fused_mlp_forward kernel is not available. "
+                             "Make sure Triton is installed and kernels are properly imported.")
         
         # Use Triton kernel for fused MLP operations
         output = fused_mlp_forward(
@@ -96,9 +136,13 @@ class FusedMLP(nn.Module):
             fc2_bias=fc2_bias,
             activation=self.config.activation_fn,
             fuse_bias_gelu=self.config.fuse_bias_gelu,
-            dropout_prob=self.config.dropout_prob,
+            dropout_prob=self.config.dropout_prob if self.training else 0.0,
             checkpoint_activation=self.config.checkpoint_activation
         )
+        
+        # Convert back to original dtype if needed
+        if output.dtype != input_dtype:
+            output = output.to(input_dtype)
         
         return output
     
