@@ -105,8 +105,22 @@ def init_components(config: OptimizerConfig):
                     logger.info("Fused MLP applied to model")
                     
             if config.kernels.use_triton_kernels:
-                # TODO: Initialize Triton kernels
-                pass
+                # Initialize Triton kernels if available
+                try:
+                    import triton
+                    from kernels.triton.flash_attention_kernels import compile_flash_attention_kernels
+                    from kernels.triton.mlp_kernels import compile_mlp_kernels
+                    from kernels.triton.layernorm_kernels import compile_layernorm_kernels
+                    
+                    logger.info("Initializing Triton kernels")
+                    compile_flash_attention_kernels()
+                    compile_mlp_kernels()
+                    compile_layernorm_kernels()
+                    logger.info("Triton kernels initialized successfully")
+                    components["triton_initialized"] = True
+                except ImportError:
+                    logger.warning("Triton not available. Skipping Triton kernel initialization.")
+                    components["triton_initialized"] = False
         except Exception as e:
             logger.error(f"Failed to initialize optimized kernels: {str(e)}")
             raise

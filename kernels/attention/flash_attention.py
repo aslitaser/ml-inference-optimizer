@@ -866,30 +866,87 @@ class FlashSelfAttention(nn.Module):
     ) -> torch.Tensor:
         """
         Compute flash attention using the fused Triton kernels for maximum efficiency.
-        NOTE: This might need adjustments for GQA/MQA if the underlying
-              `triton_fused_attention` kernel doesn't handle it.
+        This implementation handles GQA/MQA configurations by properly managing
+        different head counts for queries vs keys/values.
         """
-        # Placeholder - assumes triton_fused_attention handles GQA/MQA or num_kv_heads == num_attention_heads
-        # If not, QKV splitting/reshaping needs to happen before calling it.
-        if self.num_kv_heads != self.num_attention_heads:
-             logging.warning("_forward_triton_fused might not support GQA/MQA correctly yet.")
+        # Get QKV projections (already includes bias if present)
+        qkv = self.qkv_proj(hidden_states)
 
-        # This call likely assumes num_heads means Q heads and handles K/V internally based on weights
-        return triton_fused_attention( # Assuming this kernel exists and handles GQA
-            hidden_states=hidden_states,
-            qkv_weight=self.qkv_proj.weight,
-            qkv_bias=self.qkv_proj.bias,
-            out_weight=self.o_proj.weight,
-            out_bias=self.o_proj.bias,
+        # Get batch size and sequence length for reshaping
+        batch_size, seq_len, _ = hidden_states.shape
+        
+        # Parse the fused QKV tensor
+        q_dim = self.hidden_size
+        kv_dim = self.num_kv_heads * self.head_dim
+        
+        # Split into query, key, and value tensors
+        q = qkv[:, :, :q_dim]
+        k = qkv[:, :, q_dim:q_dim + kv_dim]
+        v = qkv[:, :, q_dim + kv_dim:]
+        
+        # Reshape for multi-head attention
+        # [batch, seq, q_heads*head_dim] -> [batch, seq, q_heads, head_dim]
+        q = q.view(batch_size, seq_len, self.num_attention_heads, self.head_dim)
+        # [batch, seq, kv_heads*head_dim] -> [batch, seq, kv_heads, head_dim]
+        k = k.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        v = v.view(batch_size, seq_len, self.num_kv_heads, self.head_dim)
+        
+        # Handle GQA/MQA by repeating keys and values if needed
+        if self.num_kv_heads < self.num_attention_heads:
+            # For GQA/MQA, need to repeat keys and values
+            repeat_factor = self.num_attention_heads // self.num_kv_heads
+            
+            if repeat_factor > 1:
+                # Repeat each key/value head repeat_factor times
+                # This expands [batch, seq, kv_heads, head_dim] to [batch, seq, q_heads, head_dim]
+                k = k.repeat_interleave(repeat_factor, dim=2)
+                v = v.repeat_interleave(repeat_factor, dim=2)
+                
+                # Handle non-divisible cases (e.g., if num_attention_heads % num_kv_heads != 0)
+                if k.size(2) < self.num_attention_heads:
+                    # Repeat the last head enough times to match num_attention_heads
+                    remaining = self.num_attention_heads - k.size(2)
+                    k_extra = k[:, :, -1:].repeat(1, 1, remaining, 1)
+                    v_extra = v[:, :, -1:].repeat(1, 1, remaining, 1)
+                    k = torch.cat([k, k_extra], dim=2)
+                    v = torch.cat([v, v_extra], dim=2)
+        
+        # Prepare softmax scale
+        head_dim = q.shape[-1]
+        softmax_scale = self.config.softmax_scale or (1.0 / math.sqrt(head_dim))
+        
+        # Process attention mask if provided
+        if attention_mask is not None:
+            # Convert mask to compatible format if needed
+            if attention_mask.dim() == 2:
+                attention_mask = attention_mask.unsqueeze(1).unsqueeze(1)  # [batch, 1, 1, seq]
+            elif attention_mask.dim() == 3:
+                attention_mask = attention_mask.unsqueeze(1)  # [batch, 1, seq, seq]
+            
+            # Make sure mask is in the correct format for the kernel
+            if attention_mask.shape[-2] != seq_len or attention_mask.shape[-1] != seq_len:
+                raise ValueError(f"Attention mask shape {attention_mask.shape} incompatible with sequence length {seq_len}")
+        
+        # Call the Triton kernel with properly prepared tensors
+        output = triton_fused_attention(
+            q=q,
+            k=k,
+            v=v,
             mask=attention_mask,
             causal=self.config.causal,
-            num_heads=self.num_attention_heads, # Pass Q heads
-            # num_kv_heads=self.num_kv_heads # Pass KV heads if kernel supports it
-            head_dim=self.head_dim,
+            softmax_scale=softmax_scale,
             dropout_p=self.config.dropout_p if self.training else 0.0,
-            softmax_scale=self.config.softmax_scale,
-            block_size=self.config.block_size,
+            head_dim=self.head_dim,
+            block_size=self.config.block_size
         )
+        
+        # Reshape output: [batch, seq, num_heads, head_dim] -> [batch, seq, hidden_size]
+        output = output.reshape(batch_size, seq_len, self.hidden_size)
+        
+        # Apply output projection
+        output = self.o_proj(output)
+        
+        return output
 
 
 class ModelConverter:

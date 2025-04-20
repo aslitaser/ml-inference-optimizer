@@ -11,6 +11,71 @@ import numpy as np
 from dash import html
 import dash_bootstrap_components as dbc
 
+def generate_optimization_recommendations(bottlenecks: List[Dict[str, Any]], config: Any) -> List[str]:
+    """
+    Generate optimization recommendations based on bottleneck analysis.
+    
+    Args:
+        bottlenecks: List of identified bottlenecks
+        config: Configuration object
+        
+    Returns:
+        List of recommendation strings
+    """
+    recommendations = []
+    
+    # Initialize the recommender with profiling data and model info
+    profile_data = {
+        "bottlenecks": bottlenecks,
+        "total_time": sum(b.get("duration_ms", 0) for b in bottlenecks),
+        "operations": bottlenecks,
+        "batch_size": getattr(config.model, "max_batch_size", 1),
+        "sequence_length": getattr(config.model, "max_sequence_length", 512),
+        "device": "gpu" if getattr(config.hardware, "gpu_count", 0) > 0 else "cpu",
+        "is_training": False  # Assume inference by default
+    }
+    
+    model_info = {
+        "model_name": getattr(config.model, "model_name_or_path", ""),
+        "model_type": getattr(config.model, "model_type", ""),
+        "model_size": getattr(config.model, "parameter_count", 0),
+        "num_gpus": getattr(config.hardware, "gpu_count", 1),
+        "gpu_memory": getattr(config.hardware, "gpu_memory_gb", 16)
+    }
+    
+    # Create recommender
+    recommender = OptimizationRecommender(profile_data, model_info)
+    recommendation_objects = recommender.generate_recommendations()
+    
+    # Convert to readable strings
+    for rec in recommendation_objects:
+        # Format the recommendation message
+        message = f"{rec['title']}: {rec['description']}"
+        
+        # Add implementation details
+        message += f"\n  Implementation: {rec['implementation']}"
+        
+        # Add potential improvements
+        message += "\n  Estimated improvements:"
+        message += f"\n    - Latency: {rec.get('latency_improvement', 0):.1f}%"
+        message += f"\n    - Throughput: {rec.get('throughput_improvement', 0):.1f}%"
+        message += f"\n    - Memory: {rec.get('memory_improvement', 0):.1f}%"
+        message += f"\n  Confidence: {rec.get('confidence', 0.5):.1f}"
+        
+        recommendations.append(message)
+    
+    # If no specific recommendations, add general advice
+    if not recommendations:
+        recommendations = [
+            "Consider using Flash Attention for improved memory efficiency",
+            "Enable tensor parallelism if using multiple GPUs to reduce memory per device",
+            "Try mixed precision (FP16/BF16) for faster computation",
+            "Use fused operations to reduce kernel launch overhead and memory traffic",
+            "Enable Triton kernels for automatic optimization of CUDA operations"
+        ]
+    
+    return recommendations
+
 
 class OptimizationRecommender:
     """Base class for optimization recommendation"""
